@@ -6,12 +6,16 @@ import logging
 import sqlite3
 from pathlib import Path
 import threading
+import tempfile
+import os
 from typing import Literal
 
 from pydantic import BaseModel
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, Response, FileResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from PIL import Image, ImageOps
 import uvicorn
 
@@ -42,6 +46,40 @@ def create_app(config):
     def home():
         return Path(__file__).with_name('index.html').read_text()
 
+    @app.get('/api/database/backup')
+    def download_backup():
+        path = index.backup_database()
+        return FileResponse(path, media_type='application/vnd.sqlite3', filename='imageanalyser-backup.sqlite3',
+                            background=BackgroundTask(path.unlink, missing_ok=True))
+
+    @app.post('/api/database/restore')
+    async def restore_backup(request: Request, confirm: bool = Query(False)):
+        if not confirm:
+            raise HTTPException(400, 'Confirm database restore before uploading')
+        fd, filename = tempfile.mkstemp(suffix='.sqlite3')
+        os.close(fd)
+        path = Path(filename)
+        try:
+            size = 0
+            with path.open('wb') as stream:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > 256 * 1024 * 1024:
+                        raise HTTPException(413, 'Backup exceeds the 256 MB upload limit')
+                    stream.write(chunk)
+            if not size:
+                raise HTTPException(400, 'Select a SQLite backup file')
+            try:
+                safety = await run_in_threadpool(index.restore_database, path)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            except (OSError, sqlite3.Error):
+                index.log.exception('Database restore failed')
+                raise HTTPException(500, 'Restore failed; see Logs for details')
+            return {'restored': True, 'paused': True, 'safety_backup': safety}
+        finally:
+            path.unlink(missing_ok=True)
+
     @app.get('/api/settings')
     def get_settings():
         return index.get_settings()
@@ -69,7 +107,7 @@ def create_app(config):
                 "SELECT path,error FROM images WHERE status='error' AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
                 (since, since))]
         with index.state_lock:
-            return {**index.state, 'paused': index.paused, 'roots': dict(index.state['roots']), 'counts': counts, 'errors': errors}
+            return {**index.state, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': dict(index.state['progress']), 'counts': counts, 'errors': errors}
 
     @app.post('/api/scanner/details/clear')
     def clear_scanner_details(body: ClearRequest):

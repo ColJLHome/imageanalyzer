@@ -19,6 +19,8 @@ Open http://127.0.0.1:8090. Scanning starts automatically and repeats hourly by 
 
 For Ryzen AI Max hardware, use a llama.cpp build with working GPU acceleration (Vulkan or compatible ROCm). Confirm GPU use in llama-server's logs. Select the model and GPU memory allocation for your machine; the indexer works independently of the model choice.
 
+The progress display first shows image discovery, then the number checked and remaining for the current scan. Every supported file counts as checked after processing, including unchanged, excluded, cached, and failed images. The total covers files discovered on available roots; mount and traversal errors are reported separately. Progress is live for the current process and resets on restart.
+
 Use **Scan for new images** on the Images tab to check all configured folders immediately. New and changed images are analysed; unchanged indexed images are skipped. This also resumes scanning if paused. If a scan is already running, the existing scan continues. Search results refresh as newly analysed images become available.
 
 ## Clearing the index and diagnosing issues
@@ -38,6 +40,12 @@ Open the **Settings** tab to change the llama-server base URL, model name/alias,
 Settings saved through the screen are stored in the local SQLite database and override the corresponding `config.json` values on subsequent starts. Other configuration, including data directory, bind address, port, and scan interval, stays in `config.json`. The settings screen does not store or expose API keys; authentication continues to use `LLAMA_API_KEY` in the application server environment.
 
 Changing the model field selects the name/alias sent with requests; model installation and loading are managed by llama-server. Existing completed analyses are retained. To rebuild them with the new model, clear the image index and scan again. Records from removed folders remain searchable, while their previews are blocked because they are outside the configured roots.
+
+## Database backup and restore
+
+In **Settings → Database backup and restore**, select **Download database backup** to save a consistent SQLite snapshot, even while scanning. Backups include image records, analyses, hashes, exclusions, and database settings. Original images, logs, `config.json`, and environment API keys are not included.
+
+Choose a backup file and select **Restore database**, then confirm in the dialog. Uploads are limited to 256 MB and must be a valid Image Analyser database from the current schema version (including SHA-256 support). The server checks SQLite integrity, schema, saved settings, and completed analysis data before changing the active database. It first saves a safety backup at `data_dir/backups/before-restore-*.sqlite3`. Restore replaces the index and database settings, discards in-flight results, and leaves scanning paused. Check the restored folder paths and server settings, then select **Scan for new images** to resume. Safety backups are retained until you remove them manually; they can also be uploaded to restore the previous state.
 
 ## Configuration
 

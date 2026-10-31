@@ -10,6 +10,8 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 </style>
 <h1>Image Analyser</h1><p>Search your collection by objects, scenes, and colours.</p>
 <div id="status" role="status">Loading index status…</div>
+<div id="scan-progress-label" role="status"></div>
+<progress id="scan-progress" aria-label="Images checked in current scan" hidden style="width:100%;max-width:650px;margin-top:10px"></progress>
 <nav role="tablist" aria-label="Image analyser views"><button id="images-tab" role="tab" aria-selected="true" aria-controls="images-panel">Images</button><button id="scanner-tab" role="tab" aria-selected="false" aria-controls="scanner-panel" tabindex="-1">Scanner details</button><button id="logs-tab" role="tab" aria-selected="false" aria-controls="logs-panel" tabindex="-1">Logs</button><button id="settings-tab" role="tab" aria-selected="false" aria-controls="settings-panel" tabindex="-1">Settings</button></nav>
 <section id="images-panel" role="tabpanel" aria-labelledby="images-tab">
 <div class="controls"><button id="scan-now" type="button">Scan for new images</button><button id="clear-images" class="danger" type="button">Clear image index</button><button id="resume-scan" type="button">Resume scanning</button></div>
@@ -46,6 +48,15 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 <p>Existing indexed images are kept. Removed folders are no longer scanned and their previews become unavailable. To reanalyse existing images with a new model, clear the image index, then scan again. Saving keeps a paused scanner paused.</p>
 <button id="save-settings" type="submit" disabled>Save settings</button>
 </form><div id="settings-message" role="status"></div>
+<h2>Database backup and restore</h2>
+<p>Download a consistent SQLite backup containing analyses, image hashes, exclusions, and saved settings. Image files and diagnostic logs are stored separately.</p>
+<button id="download-backup" type="button">Download database backup</button>
+<form id="restore-form">
+<label>SQLite backup file <input id="restore-file" type="file" accept=".sqlite3,.sqlite,.db" required></label>
+<button id="restore-backup" class="danger" type="submit">Restore database</button>
+</form>
+<p>Restore replaces the current index and saved settings, and pauses scanning. A safety backup of the current database is kept in data_dir/backups. Maximum upload: 256 MB.</p>
+<div id="database-message" role="status"></div>
 </section>
 <dialog id="clear-index-dialog" aria-labelledby="clear-index-title" aria-describedby="clear-index-description">
 <h2 id="clear-index-title">Clear the image index?</h2>
@@ -53,11 +64,17 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 <p>Resume scanning afterwards to rebuild the index.</p>
 <form method="dialog"><button type="submit" value="cancel" autofocus>Cancel</button><button type="submit" value="clear" class="danger">Clear index</button></form>
 </dialog>
+<dialog id="restore-dialog" aria-labelledby="restore-title" aria-describedby="restore-description">
+<h2 id="restore-title">Restore database backup?</h2>
+<p id="restore-description">This replaces your current image index, hashes, exclusions, and saved settings with the selected backup. Scanning will be paused. Original image files and logs will be kept.</p>
+<p>A safety backup of your current database will be saved before restoring.</p>
+<form method="dialog"><button type="submit" value="cancel" autofocus>Cancel</button><button type="submit" value="restore" class="danger">Restore backup</button></form>
+</dialog>
 <script>
 const $=id=>document.getElementById(id);let settingsLoaded=false;let offset=0,total=0,request=0,lastIndexedCount=null;const limit=60;
 function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el}
 async function search(){const current=++request;const params=new URLSearchParams(new FormData($('search')));params.set('offset',offset);params.set('limit',limit);$('message').textContent='Searching…';try{const response=await fetch('/api/search?'+params);if(!response.ok)throw Error('Search failed');const data=await response.json();if(current!==request)return;total=data.total;$('grid').replaceChildren();for(const item of data.items){const card=node('article'),img=node('img');img.src='/api/images/'+item.id+'/thumbnail';img.alt=item.analysis.description;img.loading='lazy';img.onerror=()=>{img.alt='Preview unavailable: '+item.path};card.append(img);const body=node('div',undefined,'body');body.append(node('div',item.analysis.description));for(const field of ['scenes','objects','colours']){const line=node('p');line.append(node('strong',field+': '));for(const tag of item.analysis[field])line.append(node('span',tag,'tag'));body.append(line)}const palette=node('div',undefined,'palette');for(const colour of item.palette){const swatch=node('div');swatch.style.backgroundColor=colour.hex;swatch.style.flex=colour.fraction;swatch.title=colour.hex;palette.append(swatch)}body.append(palette,node('p',item.path,'path'));const remove=node('button','Remove from index');remove.type='button';remove.onclick=async()=>{if(!confirm('Remove this image from the index? The original file will be kept and future scans will skip it.'))return;remove.disabled=true;try{await action('/api/images/'+item.id,'DELETE');if(data.items.length===1&&offset>0)offset=Math.max(0,offset-limit);await search();await status();$('action-message').textContent='Image removed from index. Original file kept.'}catch(error){$('action-message').textContent=error.message;remove.disabled=false}};body.append(remove);card.append(body);$('grid').append(card)}$('message').textContent=total?total+' matching images':'No indexed images match. The scanner may still be analysing your collection.';$('page').textContent=total?(offset+1)+'–'+Math.min(offset+limit,total):'0';$('prev').disabled=offset===0;$('next').disabled=offset+limit>=total}catch(error){if(current===request)$('message').textContent=error.message}}
-async function status(){try{const response=await fetch('/api/status');if(!response.ok)throw Error();const s=await response.json();$('status').textContent=(s.paused?'Scanning paused':s.running?'Scanning':'Waiting for next scan')+' · '+(s.counts.done||0)+' indexed · '+(s.counts.error||0)+' errors';$('resume-scan').hidden=!s.paused;$('scan-now').disabled=s.running&&!s.paused;const count=s.counts.done||0;if(lastIndexedCount!==null&&lastIndexedCount!==count)search();lastIndexedCount=count;$('details').textContent=JSON.stringify({current:s.current,roots:s.roots,last_scan:s.last_scan?new Date(s.last_scan*1000).toLocaleString():null,recent_errors:s.errors},null,2)}catch{$('status').textContent='Unable to reach server'}}
+async function status(){try{const response=await fetch('/api/status');if(!response.ok)throw Error();const s=await response.json();$('status').textContent=(s.paused?'Scanning paused':s.running?'Scanning':'Waiting for next scan')+' · '+(s.counts.done||0)+' indexed · '+(s.counts.error||0)+' errors';const progress=s.progress||{};const bar=$('scan-progress');bar.hidden=progress.phase==='idle'||!progress.phase;if(progress.total===null){bar.removeAttribute('value');$('scan-progress-label').textContent=progress.phase==='discovering'?'Discovering images: '+(progress.discovered||0)+' found…':progress.phase==='paused'?'Scan paused.':'No scan progress yet.'}else{bar.max=progress.total||1;bar.value=progress.scanned||0;$('scan-progress-label').textContent=(progress.scanned||0)+' of '+progress.total+' images checked · '+Math.max(0,progress.total-(progress.scanned||0))+' remaining'+(progress.phase==='paused'?' (paused)':progress.phase==='complete'?' (complete)':'')} $('resume-scan').hidden=!s.paused;$('scan-now').disabled=s.running&&!s.paused;const count=s.counts.done||0;if(lastIndexedCount!==null&&lastIndexedCount!==count)search();lastIndexedCount=count;$('details').textContent=JSON.stringify({current:s.current,roots:s.roots,last_scan:s.last_scan?new Date(s.last_scan*1000).toLocaleString():null,recent_errors:s.errors},null,2)}catch{$('status').textContent='Unable to reach server'}}
 $('search').onsubmit=e=>{e.preventDefault();offset=0;search()};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);search()};$('next').onclick=()=>{offset+=limit;search()};search();status();setInterval(status,5000);
 function showTab(name){for(const tab of ['images','scanner','logs','settings']){const selected=tab===name;$(tab+'-tab').setAttribute('aria-selected',String(selected));$(tab+'-tab').tabIndex=selected?0:-1;$(tab+'-panel').hidden=!selected}if(name==='logs')loadLogs();if(name==='scanner')status();if(name==='settings'&&!settingsLoaded)loadSettings()}
 for(const tab of ['images','scanner','logs','settings']){$(tab+'-tab').onclick=()=>showTab(tab);$(tab+'-tab').onkeydown=e=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key)){e.preventDefault();const tabs=['images','scanner','logs','settings'];const target=e.key==='Home'?tabs[0]:e.key==='End'?tabs[tabs.length-1]:tabs[(tabs.indexOf(tab)+(e.key==='ArrowRight'?1:tabs.length-1))%tabs.length];showTab(target);$(target+'-tab').focus()}}}
@@ -74,6 +91,23 @@ async function loadSettings(){
 $('settings-form').onsubmit=async event=>{
     event.preventDefault();const button=$('save-settings');button.disabled=true;
     try{const data=await settingsRequest({method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({llama_url:$('setting-url').value,model:$('setting-model').value,roots:$('setting-roots').value.split('\n').map(value=>value.trim()).filter(Boolean),request_timeout_seconds:Number($('setting-timeout').value),max_output_tokens:Number($('setting-tokens').value),enable_thinking:$('setting-thinking').checked})});$('setting-url').value=data.llama_url;$('setting-roots').value=data.roots.join('\n');$('settings-message').textContent='Settings saved. New analyses will use these settings. If scanning is paused, use Scan for new images to resume.';await status()}catch(error){$('settings-message').textContent=error.message}finally{button.disabled=false}
+};
+$('download-backup').onclick=()=>{window.location.href='/api/database/backup'};
+$('restore-form').onsubmit=async event=>{
+    event.preventDefault();const file=$('restore-file').files[0];
+    if(!file)return;
+    if(file.size>256*1024*1024){$('database-message').textContent='Backup exceeds the 256 MB upload limit.';return}
+    const dialog=$('restore-dialog');dialog.returnValue='cancel';
+    const confirmed=new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='restore'),{once:true}));dialog.showModal();
+    if(!await confirmed)return;
+    const button=$('restore-backup');button.disabled=true;$('database-message').textContent='Uploading and validating backup…';
+    try{
+        const response=await fetch('/api/database/restore?confirm=true',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
+        const data=await response.json();if(!response.ok)throw Error(data.detail||'Restore failed');
+        offset=0;lastIndexedCount=null;settingsLoaded=false;await loadSettings();await search();await status();
+        $('database-message').textContent='Database restored. Scanning is paused. Safety backup: data_dir/backups/'+data.safety_backup;
+        $('restore-file').value='';
+    }catch(error){$('database-message').textContent=error.message}finally{button.disabled=false}
 };
 async function loadLogs(){try{const response=await fetch('/api/logs');if(!response.ok)throw Error('Unable to load logs');const data=await response.json();const output=$('logs-output'),atEnd=output.scrollHeight-output.scrollTop-output.clientHeight<30;output.textContent=data.lines.join('\n')||'No diagnostic events yet.';if(atEnd)output.scrollTop=output.scrollHeight;$('logs-status').textContent=' Updated '+new Date().toLocaleTimeString()}catch(error){$('logs-status').textContent=error.message}}
 $('copy-logs').onclick=async()=>{

@@ -260,6 +260,94 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.index.search()['total'], 1)
         self.assertEqual(self.index.search()['items'][0]['path'], str(copied))
 
+    def test_scan_progress_counts_checked_and_remaining_including_skips(self):
+        second = self.root / 'second.png'
+        Image.new('RGB', (30, 30), 'blue').save(second)
+        snapshots = []
+        def analyse(path):
+            snapshots.append(dict(self.index.state['progress']))
+            return self.fake_analysis(path)
+        with patch.object(self.index, 'analyse', side_effect=analyse):
+            self.index.scan()
+        self.assertEqual([p['total'] for p in snapshots], [2, 2])
+        self.assertEqual([p['scanned'] for p in snapshots], [0, 1])
+        progress = self.index.state['progress']
+        self.assertEqual(progress, {'phase': 'complete', 'scanned': 2, 'total': 2, 'discovered': 2})
+        with patch.object(self.index, 'analyse') as analyse:
+            self.index.scan()
+            analyse.assert_not_called()
+        self.assertEqual(self.index.state['progress']['scanned'], 2)
+        self.assertEqual(self.index.state['progress']['total'], 2)
+
+    def test_scan_progress_pauses_when_index_cleared_during_analysis(self):
+        def clear(path):
+            self.index.clear()
+            return self.fake_analysis(path)
+        with patch.object(self.index, 'analyse', side_effect=clear):
+            self.index.scan()
+        self.assertEqual(self.index.state['progress']['phase'], 'paused')
+        self.assertEqual(self.index.state['progress']['scanned'], 0)
+        self.assertEqual(self.index.state['progress']['total'], 1)
+        self.assertFalse(self.index.state['running'])
+
+    def test_database_backup_restore_roundtrip_and_safety_backup(self):
+        app = create_app(self.config)
+        index = app.state.index
+        self.addCleanup(index.log_handler.close)
+        client = TestClient(app)
+        with patch.object(index, 'analyse', side_effect=self.fake_analysis):
+            index.scan()
+        from imageanalyser.settings import RuntimeSettings
+        index.save_settings(RuntimeSettings(**{**index.get_settings(), 'model': 'saved-model'}))
+        downloaded = client.get('/api/database/backup')
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertTrue(downloaded.content.startswith(b'SQLite format 3'))
+        image_id = index.search()['items'][0]['id']
+        index.remove_image(image_id)
+        response = client.post('/api/database/restore?confirm=true', content=downloaded.content,
+                               headers={'Content-Type': 'application/octet-stream'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(index.search()['total'], 1)
+        self.assertEqual(index.get_settings()['model'], 'saved-model')
+        self.assertTrue(index.paused)
+        safety = index.data / 'backups' / response.json()['safety_backup']
+        self.assertTrue(safety.exists())
+        import sqlite3
+        db = sqlite3.connect(safety)
+        try:
+            self.assertEqual(db.execute('SELECT status FROM images').fetchone()[0], 'removed')
+        finally:
+            db.close()
+        self.assertTrue(self.file.exists())
+
+    def test_invalid_restore_does_not_change_current_database(self):
+        app = create_app(self.config)
+        index = app.state.index
+        self.addCleanup(index.log_handler.close)
+        client = TestClient(app)
+        with patch.object(index, 'analyse', side_effect=self.fake_analysis):
+            index.scan()
+        self.assertEqual(client.post('/api/database/restore', content=b'invalid').status_code, 400)
+        self.assertEqual(client.post('/api/database/restore?confirm=true', content=b'invalid').status_code, 400)
+        self.assertEqual(client.post('/api/database/restore?confirm=true', content=b'').status_code, 400)
+        self.assertEqual(index.search()['total'], 1)
+        self.assertFalse(index.paused)
+        self.assertFalse((index.data / 'backups').exists())
+
+    def test_restore_during_analysis_discards_inflight_result(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        backup = self.index.backup_database()
+        self.addCleanup(backup.unlink, missing_ok=True)
+        Image.new('RGB', (50, 50), 'blue').save(self.file)
+        def restore_during_analysis(path):
+            self.index.restore_database(backup)
+            return {**self.result, 'description': 'Should be discarded'}, [], 50, 50
+        with patch.object(self.index, 'analyse', side_effect=restore_during_analysis):
+            self.index.scan()
+        self.assertEqual(self.index.search()['items'][0]['analysis'], self.result)
+        self.assertTrue(self.index.paused)
+
     def test_individual_removal_persists_and_full_clear_resets_exclusions(self):
         with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
             self.index.scan()

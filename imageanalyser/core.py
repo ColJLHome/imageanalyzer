@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
+import tempfile
 import time
 
 import httpx
@@ -66,6 +67,7 @@ def parse_analysis(content):
 
 class Index:
     def __init__(self, config):
+        self.base_config = dict(config)
         self.config = dict(config)
         self.roots = [Path(p).expanduser().resolve() for p in config['roots']]
         if not self.roots:
@@ -88,7 +90,8 @@ class Index:
         self.wake = threading.Event()
         self.scan_lock = threading.Lock()
         self.state_lock = threading.Lock()
-        self.state = {'running': False, 'current': None, 'roots': {}, 'last_scan': None}
+        self.state = {'running': False, 'current': None, 'roots': {}, 'last_scan': None,
+                      'progress': {'phase': 'idle', 'scanned': 0, 'total': None, 'discovered': 0}}
         with self.connect() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
@@ -109,6 +112,81 @@ class Index:
                 db.execute('ALTER TABLE images ADD COLUMN sha256 TEXT')
             db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
 
+    def backup_database(self, directory=None, prefix='imageanalyser-backup-'):
+        fd, filename = tempfile.mkstemp(prefix=prefix, suffix='.sqlite3', dir=directory)
+        os.close(fd)
+        destination = Path(filename)
+        try:
+            with self.control_lock, self.connect() as source:
+                target = sqlite3.connect(destination)
+                try:
+                    source.backup(target)
+                    target.execute('PRAGMA journal_mode=DELETE')
+                finally:
+                    target.close()
+            self.log.info('Database backup created')
+            return destination
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+
+    def restore_database(self, path):
+        source = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
+        source.row_factory = sqlite3.Row
+        try:
+            source.execute('PRAGMA trusted_schema=OFF')
+            if source.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ValueError('Database failed SQLite integrity check')
+            objects = source.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
+            if {r['name'] for r in objects if r['type'] == 'table'} != {'images', 'settings'} or any(
+                    r['type'] not in ('table', 'index') for r in objects):
+                raise ValueError('Upload an Image Analyser SQLite backup')
+            columns = {r['name']: r for r in source.execute('PRAGMA table_info(images)')}
+            required = {'id', 'path', 'size', 'mtime_ns', 'status', 'analysis', 'search_text', 'palette',
+                        'width', 'height', 'model', 'error', 'attempts', 'retry_at', 'updated', 'sha256'}
+            if not required <= columns.keys() or columns['id']['pk'] != 1:
+                raise ValueError('Backup has an unsupported image schema; use a backup from this version')
+            unique_path = any(
+                [r['name'] for r in source.execute('SELECT name FROM pragma_index_info(?)', (idx['name'],))] == ['path']
+                for idx in source.execute("SELECT name FROM pragma_index_list('images') WHERE [unique]=1"))
+            if not unique_path:
+                raise ValueError('Backup is missing the unique image path index')
+            setting_columns = {r['name']: r for r in source.execute('PRAGMA table_info(settings)')}
+            if not {'key', 'value'} <= setting_columns.keys() or setting_columns['key']['pk'] != 1:
+                raise ValueError('Backup has an unsupported settings schema')
+            saved = source.execute("SELECT value FROM settings WHERE key='runtime_config'").fetchone()
+            restored_config = {**self.base_config, **(RuntimeSettings.model_validate_json(saved['value']).model_dump() if saved else {})}
+            restored_settings = RuntimeSettings(**{key: restored_config[key] for key in RuntimeSettings.model_fields
+                                                  if key in restored_config})
+            for row in source.execute('SELECT status,analysis,palette FROM images'):
+                if row['status'] not in ('pending', 'done', 'error', 'removed'):
+                    raise ValueError('Backup contains an invalid image status')
+                if row['status'] == 'done':
+                    parse_analysis(row['analysis'])
+                    if not isinstance(json.loads(row['palette']), list):
+                        raise ValueError('Backup contains an invalid image palette')
+            with self.control_lock:
+                backups = self.data / 'backups'
+                backups.mkdir(exist_ok=True)
+                safety = self.backup_database(backups, 'before-restore-')
+                self.paused = True
+                self.generation += 1
+                with self.connect() as target:
+                    source.backup(target)
+                    target.execute("INSERT OR REPLACE INTO settings VALUES ('paused', 'true')")
+                    target.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
+                self.config = {**restored_config, **restored_settings.model_dump()}
+                self.roots = [Path(p) for p in restored_settings.roots]
+            with self.state_lock:
+                self.state.update(current=None, roots={}, last_scan=None)
+                self.state['progress'] = {'phase': 'idle', 'scanned': 0, 'total': None, 'discovered': 0}
+            self.log.info('Database restored; scanning paused. Safety backup: %s', safety)
+            return safety.name
+        except (sqlite3.DatabaseError, TypeError, KeyError) as exc:
+            raise ValueError(f'Invalid Image Analyser database: {exc}') from exc
+        finally:
+            source.close()
+
     def get_settings(self):
         with self.control_lock:
             return RuntimeSettings(**{key: self.config[key] for key in RuntimeSettings.model_fields
@@ -124,6 +202,8 @@ class Index:
             self.config = {**self.config, **values}
             self.roots = [Path(p) for p in values['roots']]
             self.generation += 1
+        with self.state_lock:
+            self.state['progress'] = {'phase': 'idle', 'scanned': 0, 'total': None, 'discovered': 0}
         self.log.info('Settings saved; %s scan folders configured', len(values['roots']))
         self.wake.set()
         return values
@@ -136,6 +216,8 @@ class Index:
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('paused', 'true')")
             self.paused = True
             self.generation += 1
+        with self.state_lock:
+            self.state['progress']['phase'] = 'paused'
         self.log.info('Cleared %s image records; scanning paused until Resume scanning', count)
         return count
 
@@ -271,12 +353,17 @@ class Index:
             scan_generation = self.generation
             roots = list(self.roots)
         with self.state_lock:
-            self.state.update(running=True, roots={})
+            self.state.update(running=True, roots={}, progress={
+                'phase': 'discovering', 'scanned': 0, 'total': None, 'discovered': 0})
         self.log.info('Scan started')
+        def interrupted():
+            return self.stop.is_set() or self.paused or scan_generation != self.generation
         try:
+            candidates = []
+            root_errors = {}
             for root in roots:
-                if self.stop.is_set() or self.paused or scan_generation != self.generation:
-                    break
+                if interrupted():
+                    return
                 if not root.is_dir():
                     self.log.warning('Root unavailable: %s', root)
                     with self.state_lock:
@@ -284,27 +371,51 @@ class Index:
                     continue
                 self.log.info('Scanning root: %s', root)
                 errors = []
+                root_errors[str(root)] = errors
                 with self.state_lock:
-                    self.state['roots'][str(root)] = 'Scanning'
+                    self.state['roots'][str(root)] = 'Discovering images'
                 for directory, dirs, files in os.walk(root, followlinks=False, onerror=lambda e: errors.append(str(e))):
+                    if interrupted():
+                        return
                     dirs[:] = [d for d in dirs if not (Path(directory) / d).is_symlink()]
                     for name in files:
-                        if self.stop.is_set() or self.paused or scan_generation != self.generation:
-                            return
                         candidate = Path(directory) / name
                         if candidate.suffix.lower() not in EXTENSIONS or candidate.is_symlink():
                             continue
-                        try:
-                            self.process(self.permitted(candidate), scan_generation)
-                        except Exception:
-                            self.log.exception('Cannot index %s', candidate)
+                        candidates.append(candidate)
+                    with self.state_lock:
+                        if scan_generation == self.generation:
+                            self.state['progress']['discovered'] = len(candidates)
                 for error in errors:
                     self.log.warning('Folder traversal failed: %s', error)
+            # Overlapping configured roots should not count the same path twice.
+            candidates = list(dict.fromkeys(candidates))
+            with self.state_lock:
+                if scan_generation == self.generation:
+                    self.state['progress'].update(phase='scanning', total=len(candidates), discovered=len(candidates))
+            self.log.info('Discovered %s images to check', len(candidates))
+            for candidate in candidates:
+                if interrupted():
+                    return
                 with self.state_lock:
-                    self.state['roots'][str(root)] = '; '.join(errors) if errors else 'Scanned'
+                    self.state['current'] = str(candidate)
+                try:
+                    self.process(self.permitted(candidate), scan_generation)
+                except Exception:
+                    self.log.exception('Cannot index %s', candidate)
+                finally:
+                    with self.state_lock:
+                        if scan_generation == self.generation:
+                            self.state['progress']['scanned'] += 1
+            with self.state_lock:
+                if scan_generation == self.generation:
+                    for root, errors in root_errors.items():
+                        self.state['roots'][root] = '; '.join(errors) if errors else 'Scanned'
         finally:
             with self.state_lock:
                 self.state.update(running=False, current=None, last_scan=time.time())
+                if scan_generation == self.generation:
+                    self.state['progress']['phase'] = 'paused' if self.paused else 'interrupted' if interrupted() else 'complete'
             self.scan_lock.release()
             self.log.info('Scan finished%s', ' (paused)' if self.paused else '')
 
