@@ -415,6 +415,56 @@ class IndexTests(unittest.TestCase):
                     process.kill()
                     process.wait()
 
+    def test_a1111_png_metadata_is_stored_searchable_and_reused(self):
+        from PIL.PngImagePlugin import PngInfo
+        info = PngInfo()
+        text = 'a sapphire velvet jacket, <lora:wardrobe:0.7>\nNegative prompt: blurry, watermark\nSteps: 30, Sampler: DPM++ 2M, CFG scale: 7, Seed: 123456, Model: dream-model'
+        info.add_text('parameters', text)
+        Image.new('RGB', (100, 50), 'red').save(self.file, pnginfo=info)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis) as call:
+            self.index.scan()
+            shutil.copyfile(self.file, self.root / 'copy.png')
+            self.index.scan()
+            self.assertEqual(call.call_count, 1)
+        for query in ('sapphire velvet', 'wardrobe', 'watermark', '123456', 'dream-model', 'DPM++'):
+            self.assertEqual(self.index.search(query)['total'], 2)
+        metadata = self.index.search()['items'][0]['a1111_metadata']
+        self.assertEqual(metadata['raw'], text)
+        self.assertEqual(metadata['negative_prompt'], 'blurry, watermark')
+        self.assertTrue(metadata['parameters'].startswith('Steps: 30'))
+
+    def test_a1111_exif_unicode_and_ascii_comments(self):
+        from imageanalyser.metadata import read_a1111_metadata, decode_comment
+        text = 'a café scene\nNegative prompt: fog\nSteps: 20, Seed: 42'
+        exif = Image.Exif()
+        exif[0x8769] = {37510: b'UNICODE\x00' + text.encode('utf-16-be')}
+        jpeg = self.root / 'photo.jpg'
+        Image.new('RGB', (20, 20)).save(jpeg, exif=exif)
+        self.assertEqual(read_a1111_metadata(jpeg)['prompt'], 'a café scene')
+        self.assertEqual(decode_comment(b'ASCII\x00\x00\x00Steps: 20'), 'Steps: 20')
+        self.assertIsNone(read_a1111_metadata(self.file))
+
+    def test_old_results_reanalysed_once_without_restoring_removed_images(self):
+        from imageanalyser.core import ANALYSIS_VERSION
+        second = self.root / 'second.png'
+        Image.new('RGB', (40, 40), 'blue').save(second)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        self.index.remove_image(self.index.search('second')['items'][0]['id'])
+        with self.index.connect() as db:
+            db.execute('UPDATE images SET analysis_version=0')
+        restarted = Index(self.config)
+        self.addCleanup(restarted.log_handler.close)
+        with patch.object(restarted, 'analyse', side_effect=self.fake_analysis) as analyse:
+            restarted.scan()
+            restarted.scan()
+            self.assertEqual(analyse.call_count, 1)
+        with restarted.connect() as db:
+            rows = db.execute('SELECT status,analysis_version FROM images ORDER BY id').fetchall()
+            self.assertEqual(rows[0]['analysis_version'], ANALYSIS_VERSION)
+            self.assertEqual(rows[1]['status'], 'removed')
+        self.assertEqual(restarted.search()['total'], 1)
+
     def test_scan_progress_counts_checked_and_remaining_including_skips(self):
         second = self.root / 'second.png'
         Image.new('RGB', (30, 30), 'blue').save(second)

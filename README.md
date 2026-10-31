@@ -33,6 +33,12 @@ The **Scanner details** tab shows current activity, folder status, and recent er
 
 The **Logs** tab refreshes every five seconds while open and shows recent scanner events, image analysis durations, unavailable roots, and exception tracebacks. Logs are written to `data_dir/imageanalyser.log`, with three rotating backups of up to 2 MB each. The tab displays up to 300 recent lines from the current file; older entries are available in the backups. Clearing images retains diagnostic logs. These are application logs; llama-server's own GPU and inference logs remain in its console or service journal.
 
+## A1111 generation metadata
+
+Embedded AUTOMATIC1111 `parameters` text in PNG files and EXIF UserComment text in JPEG/WebP files is stored in SQLite and included in the main text search. Search can match positive and negative prompts, LoRA names, model names, seeds, samplers, and other saved generation parameters. Expand **A1111 generation metadata** on an image card to view the original text. Prompt text is kept separate from visual descriptions and is not sent to the vision model; generation prompts, especially negative prompts, do not establish what is visible in the image. Sidecar `.txt` files are not read.
+
+On upgrading to this version, older completed analyses are automatically refreshed once during scanning, adding metadata and current people details. Hash reuse only uses results from the current analysis version, so an old result cannot bypass the refresh. Individual exclusions remain excluded, and later scans skip the refreshed images. Missing or unmounted originals wait until their folders become available. A paused scanner can be resumed with **Scan for new images**.
+
 ## People details
 
 New analyses include up to ten prominent people, describing their position in the image, visible clothing and footwear (garment types, colours, patterns, layers, and fit), and accessories. Expand **People** on an image card to see the details. Approximate age groups and visible gender presentation are labelled as estimates, with an unclear option; these do not establish exact age, sex, or gender identity. People details are included in the main text search, for example `blue striped jacket`, `young adult`, or `round glasses`.

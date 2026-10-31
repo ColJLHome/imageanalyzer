@@ -18,6 +18,9 @@ from PIL import Image, ImageOps
 
 from .settings import RuntimeSettings
 from .file_order import creation_time_ns
+from .metadata import read_a1111_metadata
+
+ANALYSIS_VERSION = 1
 
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff', '.gif'}
 PROMPT = '''Describe only what is visibly present. Return one JSON object with:
@@ -154,10 +157,16 @@ class Index:
                 analysis TEXT, search_text TEXT, palette TEXT, width INTEGER, height INTEGER,
                 model TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0, updated REAL)''')
-            columns = {row['name'] for row in db.execute('PRAGMA table_info(images)')}
-            if 'sha256' not in columns:
-                db.execute('ALTER TABLE images ADD COLUMN sha256 TEXT')
-            db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
+            self.migrate_images(db)
+
+    @staticmethod
+    def migrate_images(db):
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(images)')}
+        for column, definition in [('sha256', 'TEXT'), ('a1111_metadata', 'TEXT'),
+                                   ('analysis_version', 'INTEGER NOT NULL DEFAULT 0')]:
+            if column not in columns:
+                db.execute(f'ALTER TABLE images ADD COLUMN {column} {definition}')
+        db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
 
     def reset_analysis_timing(self):
         self.analysis_count = 0
@@ -242,7 +251,7 @@ class Index:
                 with self.connect() as target:
                     source.backup(target)
                     target.execute("INSERT OR REPLACE INTO settings VALUES ('paused', 'true')")
-                    target.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
+                    self.migrate_images(target)
                 self.config = {**restored_config, **restored_settings.model_dump()}
                 self.roots = [Path(p) for p in restored_settings.roots]
             with self.state_lock:
@@ -300,7 +309,7 @@ class Index:
                     return False
                 # Retain only file identity and an exclusion marker so scans skip it.
                 db.execute("""UPDATE images SET status='removed',analysis=NULL,search_text=NULL,
-                    palette=NULL,width=NULL,height=NULL,model=NULL,error=NULL,attempts=0,
+                    palette=NULL,width=NULL,height=NULL,model=NULL,a1111_metadata=NULL,analysis_version=0,error=NULL,attempts=0,
                     retry_at=0,updated=? WHERE id=?""", (time.time(), image_id))
         self.log.info('Removed image from index; excluded from future scans: %s', row['path'])
         return True
@@ -529,13 +538,14 @@ class Index:
         return digest.hexdigest()
 
     @staticmethod
-    def search_text(path, result):
+    def search_text(path, result, metadata=None):
         people = []
         for person in result.get('people', []):
             people.extend([person['position'], person['age_group'], person['gender_presentation'],
                            *person['clothing'], *person['accessories']])
         return ' '.join([path.name, result['description'], *result['scenes'],
-                         *result['objects'], *result['colours'], *people]).lower()
+                         *result['objects'], *result['colours'], *people,
+                         metadata['raw'] if metadata else '']).lower()
 
     def process(self, path, expected_generation=None):
         with self.control_lock:
@@ -549,10 +559,16 @@ class Index:
                 if row and row['status'] == 'removed':
                     return
                 unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
-                if unchanged and row['sha256'] and (row['status'] == 'done' or row['retry_at'] > time.time()):
+                if unchanged and row['sha256'] and ((row['status'] == 'done' and row['analysis_version'] >= ANALYSIS_VERSION) or row['retry_at'] > time.time()):
                     return
         # Stream files without holding the control lock while reading network storage.
         digest = self.hash_file(path)
+        try:
+            metadata = read_a1111_metadata(path)
+        except (OSError, ValueError, SyntaxError) as exc:
+            self.log.warning('Could not read A1111 metadata for %s: %s', path, exc)
+            metadata = None
+        metadata_json = json.dumps(metadata) if metadata else None
         after_hash = path.stat()
         if (after_hash.st_size, after_hash.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
             raise ValueError('File changed while hashing; will retry on next scan')
@@ -564,33 +580,33 @@ class Index:
                 if row and row['status'] == 'removed':
                     return
                 unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
-                if unchanged and row['status'] == 'done':
+                if unchanged and row['status'] == 'done' and row['analysis_version'] >= ANALYSIS_VERSION:
                     # Upgrade old records without calling the model again.
                     db.execute('UPDATE images SET sha256=? WHERE id=?', (digest, row['id']))
                     return
-                cached = db.execute("SELECT * FROM images WHERE sha256=? AND status='done' ORDER BY id LIMIT 1",
-                                    (digest,)).fetchone()
+                cached = db.execute("SELECT * FROM images WHERE sha256=? AND status='done' AND analysis_version>=? ORDER BY id LIMIT 1",
+                                    (digest, ANALYSIS_VERSION)).fetchone()
                 if cached:
                     result = json.loads(cached['analysis'])
                     db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,status,analysis,search_text,
-                        palette,width,height,model,updated) VALUES(?,?,?,?,'done',?,?,?,?,?,?,?)
+                        palette,width,height,model,updated,a1111_metadata,analysis_version) VALUES(?,?,?,?,'done',?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
                         sha256=excluded.sha256,status='done',analysis=excluded.analysis,
                         search_text=excluded.search_text,palette=excluded.palette,width=excluded.width,
                         height=excluded.height,model=excluded.model,error=NULL,attempts=0,retry_at=0,
-                        updated=excluded.updated""",
+                        updated=excluded.updated,a1111_metadata=excluded.a1111_metadata,analysis_version=excluded.analysis_version""",
                         (str(path), stat.st_size, stat.st_mtime_ns, digest, cached['analysis'],
-                         self.search_text(path, result), cached['palette'], cached['width'],
-                         cached['height'], cached['model'], time.time()))
+                         self.search_text(path, result, metadata), cached['palette'], cached['width'],
+                         cached['height'], cached['model'], time.time(), metadata_json, ANALYSIS_VERSION))
                     self.log.info('Reused analysis by SHA-256: %s (from %s)', path, cached['path'])
                     return
                 if unchanged and row['retry_at'] > time.time():
                     return
                 attempts = row['attempts'] if unchanged else 0
-                db.execute("""INSERT INTO images(path,size,mtime_ns,sha256) VALUES(?,?,?,?)
+                db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,a1111_metadata) VALUES(?,?,?,?,?)
                     ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
-                    sha256=excluded.sha256,status='pending',analysis=NULL,search_text=NULL,palette=NULL,error=NULL""",
-                    (str(path), stat.st_size, stat.st_mtime_ns, digest))
+                    sha256=excluded.sha256,a1111_metadata=excluded.a1111_metadata,status='pending',analysis=NULL,search_text=NULL,palette=NULL,error=NULL""",
+                    (str(path), stat.st_size, stat.st_mtime_ns, digest, metadata_json))
         with self.state_lock:
             self.state['current'] = str(path)
         self.log.info('Analysing image: %s', path)
@@ -603,16 +619,16 @@ class Index:
             after = path.stat()
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError('File changed during analysis; will retry')
-            search = self.search_text(path, result)
+            search = self.search_text(path, result, metadata)
             with self.control_lock:
                 if generation != self.generation:
                     self.log.info('Discarded analysis after index or settings changed: %s', path)
                     return
                 with self.connect() as db:
                     updated = db.execute('''UPDATE images SET status='done',analysis=?,search_text=?,palette=?,
-                        width=?,height=?,model=?,error=NULL,attempts=0,retry_at=0,updated=? WHERE path=? AND status!='removed' ''',
+                        width=?,height=?,model=?,error=NULL,attempts=0,retry_at=0,updated=?,a1111_metadata=?,analysis_version=? WHERE path=? AND status!='removed' ''',
                         (json.dumps(result), search, json.dumps(palette), width, height,
-                         model, time.time(), str(path)))
+                         model, time.time(), metadata_json, ANALYSIS_VERSION, str(path)))
                     if not updated.rowcount:
                         self.log.info('Discarded analysis for removed image: %s', path)
                         return
@@ -657,4 +673,5 @@ class Index:
             rows = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?',
                               [*params, limit, offset]).fetchall()
         return {'total': total, 'items': [dict(id=r['id'], path=r['path'], width=r['width'], height=r['height'],
-                   analysis=json.loads(r['analysis']), palette=json.loads(r['palette'])) for r in rows]}
+                   analysis=json.loads(r['analysis']), palette=json.loads(r['palette']),
+                   a1111_metadata=json.loads(r['a1111_metadata']) if r['a1111_metadata'] else None) for r in rows]}
