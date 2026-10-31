@@ -1,4 +1,5 @@
 import base64
+import hashlib
 from contextlib import contextmanager
 import io
 import json
@@ -103,6 +104,10 @@ class Index:
                 analysis TEXT, search_text TEXT, palette TEXT, width INTEGER, height INTEGER,
                 model TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0, updated REAL)''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(images)')}
+            if 'sha256' not in columns:
+                db.execute('ALTER TABLE images ADD COLUMN sha256 TEXT')
+            db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
 
     def get_settings(self):
         with self.control_lock:
@@ -303,6 +308,19 @@ class Index:
             self.scan_lock.release()
             self.log.info('Scan finished%s', ' (paused)' if self.paused else '')
 
+    @staticmethod
+    def hash_file(path):
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def search_text(path, result):
+        return ' '.join([path.name, result['description'], *result['scenes'],
+                         *result['objects'], *result['colours']]).lower()
+
     def process(self, path, expected_generation=None):
         with self.control_lock:
             if self.paused or (expected_generation is not None and expected_generation != self.generation):
@@ -315,13 +333,48 @@ class Index:
                 if row and row['status'] == 'removed':
                     return
                 unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
-                if unchanged and (row['status'] == 'done' or row['retry_at'] > time.time()):
+                if unchanged and row['sha256'] and (row['status'] == 'done' or row['retry_at'] > time.time()):
+                    return
+        # Stream files without holding the control lock while reading network storage.
+        digest = self.hash_file(path)
+        after_hash = path.stat()
+        if (after_hash.st_size, after_hash.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+            raise ValueError('File changed while hashing; will retry on next scan')
+        with self.control_lock:
+            if self.paused or generation != self.generation:
+                return
+            with self.connect() as db:
+                row = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
+                if row and row['status'] == 'removed':
+                    return
+                unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
+                if unchanged and row['status'] == 'done':
+                    # Upgrade old records without calling the model again.
+                    db.execute('UPDATE images SET sha256=? WHERE id=?', (digest, row['id']))
+                    return
+                cached = db.execute("SELECT * FROM images WHERE sha256=? AND status='done' ORDER BY id LIMIT 1",
+                                    (digest,)).fetchone()
+                if cached:
+                    result = json.loads(cached['analysis'])
+                    db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,status,analysis,search_text,
+                        palette,width,height,model,updated) VALUES(?,?,?,?,'done',?,?,?,?,?,?,?)
+                        ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
+                        sha256=excluded.sha256,status='done',analysis=excluded.analysis,
+                        search_text=excluded.search_text,palette=excluded.palette,width=excluded.width,
+                        height=excluded.height,model=excluded.model,error=NULL,attempts=0,retry_at=0,
+                        updated=excluded.updated""",
+                        (str(path), stat.st_size, stat.st_mtime_ns, digest, cached['analysis'],
+                         self.search_text(path, result), cached['palette'], cached['width'],
+                         cached['height'], cached['model'], time.time()))
+                    self.log.info('Reused analysis by SHA-256: %s (from %s)', path, cached['path'])
+                    return
+                if unchanged and row['retry_at'] > time.time():
                     return
                 attempts = row['attempts'] if unchanged else 0
-                db.execute('''INSERT INTO images(path,size,mtime_ns) VALUES(?,?,?)
+                db.execute("""INSERT INTO images(path,size,mtime_ns,sha256) VALUES(?,?,?,?)
                     ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
-                    status='pending',analysis=NULL,search_text=NULL,palette=NULL,error=NULL''',
-                    (str(path), stat.st_size, stat.st_mtime_ns))
+                    sha256=excluded.sha256,status='pending',analysis=NULL,search_text=NULL,palette=NULL,error=NULL""",
+                    (str(path), stat.st_size, stat.st_mtime_ns, digest))
         with self.state_lock:
             self.state['current'] = str(path)
         self.log.info('Analysing image: %s', path)
@@ -331,8 +384,7 @@ class Index:
             after = path.stat()
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError('File changed during analysis; will retry')
-            search = ' '.join([path.name, result['description'], *result['scenes'],
-                               *result['objects'], *result['colours']]).lower()
+            search = self.search_text(path, result)
             with self.control_lock:
                 if generation != self.generation:
                     self.log.info('Discarded analysis after index or settings changed: %s', path)

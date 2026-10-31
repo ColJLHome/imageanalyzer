@@ -1,4 +1,7 @@
 import json
+import hashlib
+import os
+import shutil
 from pathlib import Path
 import tempfile
 import threading
@@ -190,6 +193,72 @@ class IndexTests(unittest.TestCase):
         self.index.clear()
         self.index.save_settings(RuntimeSettings(**self.index.get_settings()))
         self.assertTrue(self.index.paused)
+
+    def test_hash_reuses_analysis_after_move_and_restart(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        expected_hash = hashlib.sha256(self.file.read_bytes()).hexdigest()
+        with self.index.connect() as db:
+            self.assertEqual(db.execute('SELECT sha256 FROM images').fetchone()['sha256'], expected_hash)
+        moved = self.root / 'renamed-view.png'
+        self.file.rename(moved)
+        restarted = Index(self.config)
+        self.addCleanup(restarted.log_handler.close)
+        with patch.object(restarted, 'analyse') as analyse:
+            restarted.scan()
+            analyse.assert_not_called()
+        result = restarted.search('renamed-view')['items'][0]
+        self.assertEqual(result['path'], str(moved))
+        self.assertEqual(result['analysis'], self.result)
+        self.assertIn('Reused analysis by SHA-256', '\n'.join(restarted.logs()))
+
+    def test_hash_reuses_copies_and_timestamp_changes_but_not_changed_content(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis) as analyse:
+            self.index.scan()
+            copied = self.root / 'copy.png'
+            shutil.copyfile(self.file, copied)
+            self.index.scan()
+            self.assertEqual(analyse.call_count, 1)
+            before = copied.stat()
+            os.utime(copied, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+            self.index.scan()
+            self.assertEqual(analyse.call_count, 1)
+            Image.new('RGB', (100, 50), 'green').save(copied)
+            self.index.scan()
+            self.assertEqual(analyse.call_count, 2)
+        with self.index.connect() as db:
+            hashes = {r['sha256'] for r in db.execute("SELECT sha256 FROM images WHERE status='done'")}
+            self.assertEqual(len(hashes), 2)
+
+    def test_legacy_database_migrates_and_backfills_without_analysis(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        with self.index.connect() as db:
+            db.execute('DROP INDEX images_sha256')
+            db.execute('ALTER TABLE images DROP COLUMN sha256')
+        migrated = Index(self.config)
+        self.addCleanup(migrated.log_handler.close)
+        with patch.object(migrated, 'analyse') as analyse:
+            migrated.scan()
+            analyse.assert_not_called()
+        with migrated.connect() as db:
+            self.assertEqual(db.execute('SELECT sha256 FROM images').fetchone()['sha256'],
+                             hashlib.sha256(self.file.read_bytes()).hexdigest())
+            indexes = {r['name'] for r in db.execute('PRAGMA index_list(images)')}
+            self.assertIn('images_sha256', indexes)
+        self.assertEqual(migrated.search()['total'], 1)
+
+    def test_removed_analysis_is_not_reused_for_another_path(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        self.index.remove_image(self.index.search()['items'][0]['id'])
+        copied = self.root / 'copy.png'
+        shutil.copyfile(self.file, copied)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis) as analyse:
+            self.index.scan()
+            self.assertEqual(analyse.call_count, 1)
+        self.assertEqual(self.index.search()['total'], 1)
+        self.assertEqual(self.index.search()['items'][0]['path'], str(copied))
 
     def test_individual_removal_persists_and_full_clear_resets_exclusions(self):
         with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
