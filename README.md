@@ -27,7 +27,7 @@ Use **Scan for new images** on the Images tab to check all configured folders im
 
 Every image card has a **Remove from index** button. It removes that image's analysis and search data without modifying the original file. SQLite retains its file identity with an exclusion marker so automatic scans and restarts do not add it again, even if the file changes. In-flight analysis cannot restore a removed image. **Clear image index** also resets these exclusions, allowing a full rebuild to include those files again.
 
-On the Images tab, **Clear image index** removes all stored image records and pauses scanning. It does not delete or modify source images. The pause persists across restarts. An analysis already in progress may finish its request, but its result is discarded. Select **Resume scanning** to rebuild the index from your configured folders.
+On the Settings tab, **Clear image index** removes all stored image records and pauses scanning. It does not delete or modify source images. The pause persists across restarts. An analysis already in progress may finish its request, but its result is discarded. Select **Resume scanning** to rebuild the index from your configured folders.
 
 The **Scanner details** tab shows current activity, folder status, and recent errors. **Clear scanner details** dismisses these diagnostics without deleting image records, changing retry schedules, pausing scanning, or removing logs. New activity and errors appear as scanning continues.
 
