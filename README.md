@@ -33,6 +33,12 @@ The **Scanner details** tab shows current activity, folder status, and recent er
 
 The **Logs** tab refreshes every five seconds while open and shows recent scanner events, image analysis durations, unavailable roots, and exception tracebacks. Logs are written to `data_dir/imageanalyser.log`, with three rotating backups of up to 2 MB each. The tab displays up to 300 recent lines from the current file; older entries are available in the backups. Clearing images retains diagnostic logs. These are application logs; llama-server's own GPU and inference logs remain in its console or service journal.
 
+## People details
+
+New analyses include up to ten prominent people, describing their position in the image, visible clothing and footwear (garment types, colours, patterns, layers, and fit), and accessories. Expand **People** on an image card to see the details. Approximate age groups and visible gender presentation are labelled as estimates, with an unclear option; these do not establish exact age, sex, or gender identity. People details are included in the main text search, for example `blue striped jacket`, `young adult`, or `round glasses`.
+
+Previously indexed images retain their existing analysis, including when reused by hash. To generate the additional details for your collection, back up the database, use **Settings → Clear image index**, then **Images → Scan for new images**. This also resets individual exclusions as described below. For crowded images, a higher output-token limit may be needed to fit the additional detail.
+
 ## Settings screen
 
 Open the **Settings** tab to change the llama-server base URL, model name/alias, scan folders (one absolute Linux path per line), request timeout, output-token budget, and thinking option. Folder paths refer to the server's filesystem; unavailable mounts may be saved and will be reported by the scanner. Saving queues a scan with the new settings unless scanning is paused. An in-flight request finishes but its result is discarded when settings change. Failed records become eligible for retry.

@@ -99,17 +99,17 @@ class IndexTests(unittest.TestCase):
 
     def test_llama_request_and_validation(self):
         response = type('Response', (), {'raise_for_status': lambda self: None,
-            'json': lambda self_: {'choices': [{'message': {'content': json.dumps(self.result)}}]}})()
+            'json': lambda self_: {'choices': [{'message': {'content': json.dumps({**self.result, 'people': []})}}]}})()
         with patch('imageanalyser.core.httpx.post', return_value=response) as post:
             result, palette, width, height = self.index.analyse(self.file)
-        self.assertEqual(result, self.result)
+        self.assertEqual(result, {**self.result, 'people': []})
         self.assertEqual((width, height), (100, 50))
         self.assertEqual(palette[0]['hex'], '#ff0000')
         self.assertEqual(post.call_args.args[0], 'http://localhost:8080/v1/chat/completions')
         request = post.call_args.kwargs['json']
         self.assertEqual(request['response_format']['type'], 'json_object')
         self.assertEqual(request['response_format']['schema']['required'],
-                         ['description', 'scenes', 'objects', 'colours'])
+                         ['description', 'scenes', 'objects', 'colours', 'people'])
         self.assertFalse(request['chat_template_kwargs']['enable_thinking'])
         self.assertEqual(request['max_tokens'], 2048)
         content = request['messages'][0]['content']
@@ -314,6 +314,31 @@ class IndexTests(unittest.TestCase):
         for direction in ('asc', 'desc'):
             ordered = self.index.order_candidates([missing, self.file], 'size', direction, lambda: False)
             self.assertEqual(ordered, [self.file, missing])
+
+    def test_people_details_are_stored_searchable_and_reused_by_hash(self):
+        person = {'position': 'left', 'age_group': 'young adult', 'gender_presentation': 'feminine',
+                  'clothing': ['blue striped jacket', 'black trousers', 'white trainers'],
+                  'accessories': ['round glasses', 'brown shoulder bag']}
+        analysis = {**self.result, 'people': [person]}
+        self.assertEqual(parse_analysis(json.dumps(analysis)), analysis)
+        def analyse(path):
+            _, palette, width, height = self.fake_analysis(path)
+            return analysis, palette, width, height
+        with patch.object(self.index, 'analyse', side_effect=analyse) as call:
+            self.index.scan()
+            shutil.copyfile(self.file, self.root / 'copy.png')
+            self.index.scan()
+            self.assertEqual(call.call_count, 1)
+        for query in ('striped jacket', 'young adult', 'feminine', 'round glasses', 'white trainers'):
+            self.assertEqual(self.index.search(query)['total'], 2)
+        self.assertEqual(self.index.search()['items'][0]['analysis']['people'], [person])
+        for invalid in ({**analysis, 'people': 'person'},
+                        {**analysis, 'people': [{**person, 'clothing': 'jacket'}]},
+                        {**analysis, 'people': [{**person, 'age_group': '27'}]},
+                        {**analysis, 'people': [{**person, 'gender_presentation': 'gender identity guess'}]}):
+            with self.assertRaises(ValueError):
+                parse_analysis(json.dumps(invalid))
+        self.assertEqual(parse_analysis(json.dumps(self.result)), self.result)
 
     def test_scan_progress_counts_checked_and_remaining_including_skips(self):
         second = self.root / 'second.png'

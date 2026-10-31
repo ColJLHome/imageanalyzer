@@ -24,9 +24,32 @@ PROMPT = '''Describe only what is visibly present. Return one JSON object with:
 "description": a short factual description,
 "scenes": an array of scene names,
 "objects": an array of objects including their visible colours (e.g. "red car"),
-"colours": an array of ordinary colour names.
+"colours": an array of ordinary colour names,
+"people": an array describing up to 10 prominent visible people, or [] if none.
+For each person include "position" (e.g. left, centre, foreground), "clothing" (array of
+visible garment types, colours, patterns, layers, fit and footwear), "accessories" (array),
+"age_group" (child, teenager, young adult, adult, older adult, or unclear), and
+"gender_presentation" (masculine, feminine, androgynous, or unclear).
+Use approximate apparent age groups only. Describe visible gender presentation, not gender
+identity or sex. Use unclear when visibility or appearance does not support an estimate.
+Do not guess hidden clothing or specific brands. Keep each person's details concise.
 Do not infer identities, locations, or invisible facts. No markdown.'''
 
+
+AGE_GROUPS = ('child', 'teenager', 'young adult', 'adult', 'older adult', 'unclear')
+PRESENTATIONS = ('masculine', 'feminine', 'androgynous', 'unclear')
+PERSON_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'position': {'type': 'string'},
+        'clothing': {'type': 'array', 'items': {'type': 'string'}},
+        'accessories': {'type': 'array', 'items': {'type': 'string'}},
+        'age_group': {'type': 'string', 'enum': list(AGE_GROUPS)},
+        'gender_presentation': {'type': 'string', 'enum': list(PRESENTATIONS)},
+    },
+    'required': ['position', 'clothing', 'accessories', 'age_group', 'gender_presentation'],
+    'additionalProperties': False,
+}
 
 ANALYSIS_SCHEMA = {
     'type': 'object',
@@ -34,8 +57,9 @@ ANALYSIS_SCHEMA = {
         'description': {'type': 'string'},
         **{field: {'type': 'array', 'items': {'type': 'string'}}
            for field in ('scenes', 'objects', 'colours')},
+        'people': {'type': 'array', 'items': PERSON_SCHEMA, 'maxItems': 10},
     },
-    'required': ['description', 'scenes', 'objects', 'colours'],
+    'required': ['description', 'scenes', 'objects', 'colours', 'people'],
     'additionalProperties': False,
 }
 
@@ -63,6 +87,27 @@ def parse_analysis(content):
         if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
             raise ValueError(f'Model response must contain a {field} string array')
         result[field] = [v[:200].strip().lower() for v in values[:100] if v.strip()]
+    # Older stored analyses remain valid; new requests require the people field.
+    if 'people' in data:
+        if not isinstance(data['people'], list):
+            raise ValueError('Model response people must be an array')
+        people = []
+        for person in data['people'][:10]:
+            if not isinstance(person, dict) or not isinstance(person.get('position'), str):
+                raise ValueError('Each person must include a position string')
+            entry = {'position': person['position'][:200].strip().lower()}
+            for field, allowed in (('age_group', AGE_GROUPS), ('gender_presentation', PRESENTATIONS)):
+                value = person.get(field)
+                if not isinstance(value, str) or value.strip().lower() not in allowed:
+                    raise ValueError(f'Each person must include a supported {field} estimate')
+                entry[field] = value.strip().lower()
+            for field in ('clothing', 'accessories'):
+                values = person.get(field)
+                if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+                    raise ValueError(f'Each person must include a {field} string array')
+                entry[field] = [v[:300].strip().lower() for v in values[:30] if v.strip()]
+            people.append(entry)
+        result['people'] = people
     return result
 
 
@@ -354,6 +399,8 @@ class Index:
                 raise ValueError('Model hit its output token limit before completing the answer; '
                                  'disable thinking or increase max_output_tokens')
             result = parse_analysis(content)
+            if 'people' not in result:
+                raise ValueError('Model response must contain a people array (empty if no people are visible)')
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             # Log bounded final text and metadata, never image data or request headers.
             choice = data.get('choices') if isinstance(data, dict) else None
@@ -483,8 +530,12 @@ class Index:
 
     @staticmethod
     def search_text(path, result):
+        people = []
+        for person in result.get('people', []):
+            people.extend([person['position'], person['age_group'], person['gender_presentation'],
+                           *person['clothing'], *person['accessories']])
         return ' '.join([path.name, result['description'], *result['scenes'],
-                         *result['objects'], *result['colours']]).lower()
+                         *result['objects'], *result['colours'], *people]).lower()
 
     def process(self, path, expected_generation=None):
         with self.control_lock:
