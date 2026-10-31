@@ -50,6 +50,10 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 <p>Existing indexed images are kept. Removed folders are no longer scanned and their previews become unavailable. To reanalyse existing images with a new model, clear the image index, then scan again. Saving keeps a paused scanner paused.</p>
 <button id="save-settings" type="submit" disabled>Save settings</button>
 </form><div id="settings-message" role="status"></div>
+<h2>Backend</h2>
+<p>Restart the image analyser backend. Saved settings and indexed images are retained. An unfinished analysis will be retried after startup; llama-server continues running separately. Save any settings changes first.</p>
+<button id="restart-backend" type="button">Restart backend</button>
+<div id="restart-message" role="status"></div>
 <h2>Clear image index</h2>
 <p>Clearing removes indexed records, resets individual image exclusions, and pauses scanning. Original files are kept. Resume scanning to rebuild the index.</p>
 <button id="clear-images" class="danger" type="button">Clear image index</button>
@@ -76,8 +80,13 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 <p>A safety backup of your current database will be saved before restoring.</p>
 <form method="dialog"><button type="submit" value="cancel" autofocus>Cancel</button><button type="submit" value="restore" class="danger">Restore backup</button></form>
 </dialog>
+<dialog id="restart-dialog" aria-labelledby="restart-title" aria-describedby="restart-description">
+<h2 id="restart-title">Restart backend?</h2>
+<p id="restart-description">The interface will briefly disconnect while the image analyser restarts. Indexed images and saved settings are kept. An unfinished analysis will be retried after startup.</p>
+<form method="dialog"><button type="submit" value="cancel" autofocus>Cancel</button><button type="submit" value="restart">Restart backend</button></form>
+</dialog>
 <script>
-const $=id=>document.getElementById(id);let settingsLoaded=false;let offset=0,total=0,request=0,lastIndexedCount=null;const limit=60;
+const $=id=>document.getElementById(id);let settingsLoaded=false,restartPending=false;let offset=0,total=0,request=0,lastIndexedCount=null;const limit=60;
 function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el}
 async function search(){const current=++request;const params=new URLSearchParams(new FormData($('search')));params.set('offset',offset);params.set('limit',limit);$('message').textContent='Searching…';try{const response=await fetch('/api/search?'+params);if(!response.ok)throw Error('Search failed');const data=await response.json();if(current!==request)return;total=data.total;$('grid').replaceChildren();for(const item of data.items){const card=node('article'),img=node('img');img.src='/api/images/'+item.id+'/thumbnail';img.alt=item.analysis.description;img.loading='lazy';img.onerror=()=>{img.alt='Preview unavailable: '+item.path};card.append(img);const body=node('div',undefined,'body');body.append(node('div',item.analysis.description));for(const field of ['scenes','objects','colours']){const line=node('p');line.append(node('strong',field+': '));for(const tag of item.analysis[field])line.append(node('span',tag,'tag'));body.append(line)}if(item.analysis.people?.length){const details=node('details');details.append(node('summary','People ('+item.analysis.people.length+')'));details.append(node('p','Age groups and gender presentation are visual estimates.'));for(const [i,person] of item.analysis.people.entries()){details.append(node('strong','Person '+(i+1)+(person.position?' · '+person.position:'')),node('p','Estimated age: '+person.age_group+' · Presentation: '+person.gender_presentation),node('p','Clothing: '+(person.clothing.join(', ')||'Not clearly visible')),node('p','Accessories: '+(person.accessories.join(', ')||'None identified')))}body.append(details)}const palette=node('div',undefined,'palette');for(const colour of item.palette){const swatch=node('div');swatch.style.backgroundColor=colour.hex;swatch.style.flex=colour.fraction;swatch.title=colour.hex;palette.append(swatch)}body.append(palette,node('p',item.path,'path'));const remove=node('button','Remove from index');remove.type='button';remove.onclick=async()=>{if(!confirm('Remove this image from the index? The original file will be kept and future scans will skip it.'))return;remove.disabled=true;try{await action('/api/images/'+item.id,'DELETE');if(data.items.length===1&&offset>0)offset=Math.max(0,offset-limit);await search();await status();$('action-message').textContent='Image removed from index. Original file kept.'}catch(error){$('action-message').textContent=error.message;remove.disabled=false}};body.append(remove);card.append(body);$('grid').append(card)}$('message').textContent=total?total+' matching images':'No indexed images match. The scanner may still be analysing your collection.';$('page').textContent=total?(offset+1)+'–'+Math.min(offset+limit,total):'0';$('prev').disabled=offset===0;$('next').disabled=offset+limit>=total}catch(error){if(current===request)$('message').textContent=error.message}}
 function formatDuration(seconds){
@@ -89,7 +98,7 @@ function formatDuration(seconds){
     if(hours<24)return hours+'h'+(remainder?' '+remainder+'m':'');
     return Math.floor(hours/24)+'d '+(hours%24)+'h';
 }
-async function status(){try{const response=await fetch('/api/status');if(!response.ok)throw Error();const s=await response.json();$('status').textContent=(s.paused?'Scanning paused':s.running?'Scanning':'Waiting for next scan')+' · '+(s.counts.done||0)+' indexed · '+(s.counts.error||0)+' errors';const progress=s.progress||{};const bar=$('scan-progress');bar.hidden=progress.phase==='idle'||!progress.phase;if(progress.total===null){bar.removeAttribute('value');$('scan-progress-label').textContent=progress.phase==='discovering'?'Discovering images: '+(progress.discovered||0)+' found…':progress.phase==='paused'?'Scan paused.':'No scan progress yet.'}else{bar.max=progress.total||1;bar.value=progress.scanned||0;$('scan-progress-label').textContent=(progress.scanned||0)+' of '+progress.total+' images checked · '+Math.max(0,progress.total-(progress.scanned||0))+' remaining'+(progress.phase==='scanning'?' · estimated time remaining: '+(progress.estimated_remaining_seconds==null?'calculating…':'~'+formatDuration(progress.estimated_remaining_seconds)):'')+(progress.phase==='paused'?' (paused)':progress.phase==='complete'?' (complete)':'')} $('resume-scan').hidden=!s.paused;$('scan-now').disabled=s.running&&!s.paused;const count=s.counts.done||0;if(lastIndexedCount!==null&&lastIndexedCount!==count)search();lastIndexedCount=count;$('details').textContent=JSON.stringify({current:s.current,roots:s.roots,last_scan:s.last_scan?new Date(s.last_scan*1000).toLocaleString():null,recent_errors:s.errors},null,2)}catch{$('status').textContent='Unable to reach server'}}
+async function status(){try{const response=await fetch('/api/status');if(!response.ok)throw Error();const s=await response.json();if(!restartPending){$('restart-backend').disabled=!s.restart_supported;$('restart-backend').title=s.restart_supported?'':'Launch with the imageanalyser command to enable restart'}$('status').textContent=(s.paused?'Scanning paused':s.running?'Scanning':'Waiting for next scan')+' · '+(s.counts.done||0)+' indexed · '+(s.counts.error||0)+' errors';const progress=s.progress||{};const bar=$('scan-progress');bar.hidden=progress.phase==='idle'||!progress.phase;if(progress.total===null){bar.removeAttribute('value');$('scan-progress-label').textContent=progress.phase==='discovering'?'Discovering images: '+(progress.discovered||0)+' found…':progress.phase==='paused'?'Scan paused.':'No scan progress yet.'}else{bar.max=progress.total||1;bar.value=progress.scanned||0;$('scan-progress-label').textContent=(progress.scanned||0)+' of '+progress.total+' images checked · '+Math.max(0,progress.total-(progress.scanned||0))+' remaining'+(progress.phase==='scanning'?' · estimated time remaining: '+(progress.estimated_remaining_seconds==null?'calculating…':'~'+formatDuration(progress.estimated_remaining_seconds)):'')+(progress.phase==='paused'?' (paused)':progress.phase==='complete'?' (complete)':'')} $('resume-scan').hidden=!s.paused;$('scan-now').disabled=s.running&&!s.paused;const count=s.counts.done||0;if(lastIndexedCount!==null&&lastIndexedCount!==count)search();lastIndexedCount=count;$('details').textContent=JSON.stringify({current:s.current,roots:s.roots,last_scan:s.last_scan?new Date(s.last_scan*1000).toLocaleString():null,recent_errors:s.errors},null,2)}catch{$('status').textContent='Unable to reach server'}}
 $('search').onsubmit=e=>{e.preventDefault();offset=0;search()};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);search()};$('next').onclick=()=>{offset+=limit;search()};search();status();setInterval(status,5000);
 function showTab(name){for(const tab of ['images','scanner','logs','settings']){const selected=tab===name;$(tab+'-tab').setAttribute('aria-selected',String(selected));$(tab+'-tab').tabIndex=selected?0:-1;$(tab+'-panel').hidden=!selected}if(name==='logs')loadLogs();if(name==='scanner')status();if(name==='settings'&&!settingsLoaded)loadSettings()}
 for(const tab of ['images','scanner','logs','settings']){$(tab+'-tab').onclick=()=>showTab(tab);$(tab+'-tab').onkeydown=e=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key)){e.preventDefault();const tabs=['images','scanner','logs','settings'];const target=e.key==='Home'?tabs[0]:e.key==='End'?tabs[tabs.length-1]:tabs[(tabs.indexOf(tab)+(e.key==='ArrowRight'?1:tabs.length-1))%tabs.length];showTab(target);$(target+'-tab').focus()}}}
@@ -107,6 +116,31 @@ $('settings-form').onsubmit=async event=>{
     event.preventDefault();const button=$('save-settings');button.disabled=true;
     try{const data=await settingsRequest({method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({llama_url:$('setting-url').value,model:$('setting-model').value,roots:$('setting-roots').value.split('\n').map(value=>value.trim()).filter(Boolean),request_timeout_seconds:Number($('setting-timeout').value),max_output_tokens:Number($('setting-tokens').value),enable_thinking:$('setting-thinking').checked,scan_sort_by:$('setting-sort-by').value,scan_sort_direction:$('setting-sort-direction').value})});$('setting-url').value=data.llama_url;$('setting-roots').value=data.roots.join('\n');$('settings-message').textContent='Settings saved. New analyses will use these settings. If scanning is paused, use Scan for new images to resume.';await status()}catch(error){$('settings-message').textContent=error.message}finally{button.disabled=false}
 };
+$('restart-backend').onclick=async()=>{
+    if(restartPending)return;
+    const dialog=$('restart-dialog');dialog.returnValue='cancel';
+    const confirmation=new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='restart'),{once:true}));dialog.showModal();
+    if(!await confirmation)return;
+    restartPending=true;$('restart-backend').disabled=true;$('restart-message').textContent='Requesting backend restart…';
+    try{
+        const response=await fetch('/api/backend/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});
+        const data=await response.json();if(!response.ok)throw Error(data.detail||'Restart request failed');
+        $('restart-message').textContent='Restarting backend. Waiting to reconnect…';
+        await waitForRestart(data.instance_id);
+    }catch(error){$('restart-message').textContent=error.message;restartPending=false;$('restart-backend').disabled=false}
+};
+async function waitForRestart(previousInstance){
+    const deadline=Date.now()+90000;
+    while(Date.now()<deadline){
+        await new Promise(resolve=>setTimeout(resolve,1000));
+        try{
+            const response=await fetch('/api/status',{signal:AbortSignal.timeout(3000),cache:'no-store'});
+            if(!response.ok)continue;const data=await response.json();
+            if(data.instance_id&&data.instance_id!==previousInstance){restartPending=false;settingsLoaded=false;lastIndexedCount=null;await loadSettings();await search();await status();$('restart-message').textContent='Backend restarted successfully.';return}
+        }catch{}
+    }
+    throw Error('Backend has not reconnected yet. Refresh the page or check the service logs.');
+}
 $('download-backup').onclick=()=>{window.location.href='/api/database/backup'};
 $('restore-form').onsubmit=async event=>{
     event.preventDefault();const file=$('restore-file').files[0];

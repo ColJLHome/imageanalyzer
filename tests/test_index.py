@@ -340,6 +340,81 @@ class IndexTests(unittest.TestCase):
                 parse_analysis(json.dumps(invalid))
         self.assertEqual(parse_analysis(json.dumps(self.result)), self.result)
 
+    def test_restart_api_requires_supported_launcher_and_confirmation(self):
+        unsupported = create_app(self.config)
+        self.addCleanup(unsupported.state.index.log_handler.close)
+        client = TestClient(unsupported)
+        self.assertFalse(client.get('/api/status').json()['restart_supported'])
+        self.assertEqual(client.post('/api/backend/restart', json={'confirm': True}).status_code, 503)
+        calls = []
+        app = create_app(self.config, restart_callback=lambda: calls.append(True))
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        self.assertEqual(client.post('/api/backend/restart', json={'confirm': False}).status_code, 422)
+        self.assertFalse(app.state.index.stop.is_set())
+        response = client.post('/api/backend/restart', json={'confirm': True})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()['instance_id'], app.state.instance_id)
+        self.assertTrue(app.state.index.stop.is_set())
+        self.assertEqual(calls, [True])
+        self.assertEqual(client.post('/api/backend/restart', json={'confirm': True}).status_code, 202)
+        self.assertEqual(calls, [True])
+
+    def test_cli_backend_restarts_and_preserves_database_and_settings(self):
+        import socket
+        import subprocess
+        import sys
+        import time
+        import httpx
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        with self.index.connect() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('paused', 'true')")
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        config_path = self.base / 'config.json'
+        config_path.write_text(json.dumps({**self.config, 'host': '127.0.0.1', 'port': port}))
+        log_path = self.base / 'server-output.log'
+        with log_path.open('w') as output:
+            process = subprocess.Popen([sys.executable, '-m', 'imageanalyser.app', '--config', str(config_path)],
+                                       stdout=output, stderr=subprocess.STDOUT)
+            try:
+                with httpx.Client(base_url=f'http://127.0.0.1:{port}', timeout=1) as client:
+                    def wait_for_backend(previous=None):
+                        deadline = time.monotonic() + 15
+                        while time.monotonic() < deadline:
+                            if process.poll() is not None:
+                                self.fail('Backend exited: ' + log_path.read_text())
+                            try:
+                                response = client.get('/api/status')
+                                response.raise_for_status()
+                                data = response.json()
+                                if previous is None or data['instance_id'] != previous:
+                                    return data
+                            except httpx.HTTPError:
+                                pass
+                            time.sleep(0.05)
+                        self.fail('Backend did not reconnect: ' + log_path.read_text())
+                    initial = wait_for_backend()
+                    self.assertTrue(initial['paused'])
+                    settings = client.get('/api/settings').json()
+                    response = client.put('/api/settings', json={**settings, 'model': 'persistent-model'})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(client.post('/api/backend/restart', json={'confirm': True}).status_code, 202)
+                    restarted = wait_for_backend(initial['instance_id'])
+                    self.assertTrue(restarted['paused'])
+                    self.assertEqual(client.get('/api/search').json()['total'], 1)
+                    self.assertEqual(client.get('/api/settings').json()['model'], 'persistent-model')
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
     def test_scan_progress_counts_checked_and_remaining_including_skips(self):
         second = self.root / 'second.png'
         Image.new('RGB', (30, 30), 'blue').save(second)

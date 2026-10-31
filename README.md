@@ -47,6 +47,12 @@ Settings saved through the screen are stored in the local SQLite database and ov
 
 Changing the model field selects the name/alias sent with requests; model installation and loading are managed by llama-server. Existing completed analyses are retained. To rebuild them with the new model, clear the image index and scan again. Records from removed folders remain searchable, while their previews are blocked because they are outside the configured roots.
 
+### Restarting the backend
+
+In **Settings → Backend**, select **Restart backend**, then confirm. The interface waits for a new backend instance and reconnects automatically. The database, saved settings, exclusions, and persisted scanner pause state are retained. An unfinished analysis is discarded and becomes eligible for retry after startup. Unsaved form edits are not retained. This restarts the image analyser only; it does not restart llama-server or the machine.
+
+Launch through `uv run imageanalyser --config config.json` (or the equivalent installed command). That command runs a supervisor which starts a fresh backend process on a confirmed web restart, reloading code and `config.json`. It also works with the systemd unit below. Direct custom ASGI launches do not enable the restart button. After first installing this feature, stop and start the old application once to activate the supervisor.
+
 ### Analysis order
 
 Settings includes **Analyse files in order of** (name, date created, or file size) and **Order** (ascending or descending). The default is name ascending. Name sorting is case-insensitive; date ascending means oldest first and size ascending means smallest first. Ordering is global across all configured roots, with filenames and full paths breaking ties deterministically. Unreadable files are checked last and reported in the logs. Saving a new order switches the scanner to that order after any active analysis finishes; completed files remain indexed and are skipped.

@@ -8,12 +8,13 @@ from pathlib import Path
 import threading
 import tempfile
 import os
+import uuid
 from typing import Literal
 
 from pydantic import BaseModel
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response, FileResponse
+from fastapi.responses import HTMLResponse, Response, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from PIL import Image, ImageOps
@@ -21,13 +22,14 @@ import uvicorn
 
 from .core import Index
 from .settings import RuntimeSettings
+from .runner import RESTART_EXIT_CODE, supervise
 
 
 class ClearRequest(BaseModel):
     confirm: Literal[True]
 
 
-def create_app(config):
+def create_app(config, restart_callback=None):
     index = Index(config)
 
     @asynccontextmanager
@@ -41,6 +43,9 @@ def create_app(config):
 
     app = FastAPI(title='Image Analyser', lifespan=lifespan)
     app.state.index = index
+    app.state.instance_id = uuid.uuid4().hex
+    app.state.restarting = False
+    restart_lock = threading.Lock()
 
     @app.get('/', response_class=HTMLResponse)
     def home():
@@ -80,6 +85,26 @@ def create_app(config):
         finally:
             path.unlink(missing_ok=True)
 
+    @app.post('/api/backend/restart', status_code=202)
+    def restart_backend(body: ClearRequest):
+        if restart_callback is None:
+            raise HTTPException(503, 'Restart requires launching with the imageanalyser command')
+        with restart_lock:
+            if app.state.restarting:
+                return {'restarting': True, 'instance_id': app.state.instance_id}
+            app.state.restarting = True
+
+        def restart():
+            index.log.info('Backend restart requested by user')
+            with index.control_lock:
+                index.generation += 1
+                index.stop.set()
+                index.wake.set()
+            restart_callback()
+
+        return JSONResponse({'restarting': True, 'instance_id': app.state.instance_id}, status_code=202,
+                            background=BackgroundTask(restart))
+
     @app.get('/api/settings')
     def get_settings():
         return index.get_settings()
@@ -107,7 +132,7 @@ def create_app(config):
                 "SELECT path,error FROM images WHERE status='error' AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
                 (since, since))]
         with index.state_lock:
-            return {**index.state, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'errors': errors}
+            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'errors': errors}
 
     @app.post('/api/scanner/details/clear')
     def clear_scanner_details(body: ClearRequest):
@@ -160,6 +185,7 @@ def create_app(config):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config.json')
+    parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     config_path = Path(args.config)
@@ -172,7 +198,22 @@ def main():
         )
     except (OSError, ValueError) as exc:
         parser.error(f"Cannot read configuration {config_path}: {exc}")
-    uvicorn.run(create_app(config), host=config.get('host', '127.0.0.1'), port=config.get('port', 8090), workers=1)
+    if not args.worker:
+        raise SystemExit(supervise(config_path.resolve()))
+
+    restart_requested = threading.Event()
+
+    def restart():
+        restart_requested.set()
+        server.should_exit = True
+
+    app = create_app(config, restart_callback=restart)
+    server = uvicorn.Server(uvicorn.Config(app, host=config.get('host', '127.0.0.1'),
+                                         port=config.get('port', 8090), workers=1,
+                                         timeout_graceful_shutdown=5))
+    server.run()
+    if restart_requested.is_set():
+        raise SystemExit(RESTART_EXIT_CODE)
 
 
 if __name__ == '__main__':
