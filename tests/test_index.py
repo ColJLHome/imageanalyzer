@@ -279,6 +279,47 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.index.state['progress']['scanned'], 2)
         self.assertEqual(self.index.state['progress']['total'], 2)
 
+    def test_eta_uses_analysis_average_and_current_image_elapsed_time(self):
+        Image.new('RGB', (30, 30), 'blue').save(self.root / 'second.png')
+        Image.new('RGB', (30, 30), 'green').save(self.root / 'third.png')
+        clock = [100.0]
+        starts, midway = [], []
+        def analyse(path):
+            starts.append(self.index.progress_snapshot())
+            clock[0] += 4
+            midway.append(self.index.progress_snapshot())
+            clock[0] += 6
+            return self.fake_analysis(path)
+        with patch('imageanalyser.core.time.monotonic', side_effect=lambda: clock[0]), \
+             patch.object(self.index, 'analyse', side_effect=analyse):
+            self.index.scan()
+        self.assertIsNone(starts[0]['estimated_remaining_seconds'])
+        self.assertEqual(starts[1]['average_analysis_seconds'], 10)
+        self.assertEqual(starts[1]['estimated_remaining_seconds'], 20)
+        self.assertEqual(midway[1]['estimated_remaining_seconds'], 16)
+        self.assertEqual(starts[2]['estimated_remaining_seconds'], 10)
+        complete = self.index.progress_snapshot()
+        self.assertEqual(complete['analysis_count'], 3)
+        self.assertEqual(complete['average_analysis_seconds'], 10)
+        self.assertEqual(complete['estimated_remaining_seconds'], 0)
+        # A scan that only skips existing images must not treat those as fast model calls.
+        with patch.object(self.index, 'analyse') as analyse:
+            self.index.scan()
+            analyse.assert_not_called()
+        self.assertEqual(self.index.progress_snapshot()['analysis_count'], 0)
+        self.assertIsNone(self.index.progress_snapshot()['average_analysis_seconds'])
+
+    def test_paused_scan_has_no_eta(self):
+        with self.index.state_lock:
+            self.index.state['progress'] = {'phase': 'paused', 'scanned': 1, 'total': 3, 'discovered': 3}
+            self.index.analysis_count = 1
+            self.index.analysis_seconds = 30
+        self.assertIsNone(self.index.progress_snapshot()['estimated_remaining_seconds'])
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        response = TestClient(app).get('/api/status')
+        self.assertIn('estimated_remaining_seconds', response.json()['progress'])
+
     def test_scan_progress_pauses_when_index_cleared_during_analysis(self):
         def clear(path):
             self.index.clear()

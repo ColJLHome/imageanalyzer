@@ -107,7 +107,7 @@ def create_app(config):
                 "SELECT path,error FROM images WHERE status='error' AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
                 (since, since))]
         with index.state_lock:
-            return {**index.state, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': dict(index.state['progress']), 'counts': counts, 'errors': errors}
+            return {**index.state, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'errors': errors}
 
     @app.post('/api/scanner/details/clear')
     def clear_scanner_details(body: ClearRequest):

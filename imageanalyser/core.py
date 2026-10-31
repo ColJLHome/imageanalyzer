@@ -89,9 +89,10 @@ class Index:
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.scan_lock = threading.Lock()
-        self.state_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.state = {'running': False, 'current': None, 'roots': {}, 'last_scan': None,
                       'progress': {'phase': 'idle', 'scanned': 0, 'total': None, 'discovered': 0}}
+        self.reset_analysis_timing()
         with self.connect() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
@@ -111,6 +112,27 @@ class Index:
             if 'sha256' not in columns:
                 db.execute('ALTER TABLE images ADD COLUMN sha256 TEXT')
             db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
+
+    def reset_analysis_timing(self):
+        self.analysis_count = 0
+        self.analysis_seconds = 0.0
+        self.active_analysis_started = None
+
+    def progress_snapshot(self):
+        with self.state_lock:
+            progress = dict(self.state['progress'])
+            average = self.analysis_seconds / self.analysis_count if self.analysis_count else None
+            remaining = max(0, progress['total'] - progress['scanned']) if progress['total'] is not None else None
+            estimate = None
+            if progress['phase'] in ('scanning', 'complete') and remaining is not None:
+                if remaining == 0:
+                    estimate = 0.0
+                elif average is not None:
+                    elapsed = (max(0, time.monotonic() - self.active_analysis_started)
+                               if self.active_analysis_started is not None else 0)
+                    estimate = max(0, remaining * average - min(elapsed, average))
+            return {**progress, 'analysis_count': self.analysis_count,
+                    'average_analysis_seconds': average, 'estimated_remaining_seconds': estimate}
 
     def backup_database(self, directory=None, prefix='imageanalyser-backup-'):
         fd, filename = tempfile.mkstemp(prefix=prefix, suffix='.sqlite3', dir=directory)
@@ -180,6 +202,7 @@ class Index:
             with self.state_lock:
                 self.state.update(current=None, roots={}, last_scan=None)
                 self.state['progress'] = {'phase': 'idle', 'scanned': 0, 'total': None, 'discovered': 0}
+                self.reset_analysis_timing()
             self.log.info('Database restored; scanning paused. Safety backup: %s', safety)
             return safety.name
         except (sqlite3.DatabaseError, TypeError, KeyError) as exc:
@@ -204,6 +227,7 @@ class Index:
             self.generation += 1
         with self.state_lock:
             self.state['progress'] = {'phase': 'idle', 'scanned': 0, 'total': None, 'discovered': 0}
+            self.reset_analysis_timing()
         self.log.info('Settings saved; %s scan folders configured', len(values['roots']))
         self.wake.set()
         return values
@@ -353,6 +377,7 @@ class Index:
             scan_generation = self.generation
             roots = list(self.roots)
         with self.state_lock:
+            self.reset_analysis_timing()
             self.state.update(running=True, roots={}, progress={
                 'phase': 'discovering', 'scanned': 0, 'total': None, 'discovered': 0})
         self.log.info('Scan started')
@@ -490,6 +515,9 @@ class Index:
             self.state['current'] = str(path)
         self.log.info('Analysing image: %s', path)
         started = time.monotonic()
+        with self.state_lock:
+            if generation == self.generation:
+                self.active_analysis_started = started
         try:
             result, palette, width, height = self.analyse(path)
             after = path.stat()
@@ -517,6 +545,13 @@ class Index:
                 with self.connect() as db:
                     db.execute("UPDATE images SET status='error',error=?,attempts=?,retry_at=?,updated=? WHERE path=? AND status!='removed'",
                         (str(exc)[:1000], attempts + 1, time.time() + min(3600, 60 * 2 ** min(attempts, 6)), time.time(), str(path)))
+
+        finally:
+            with self.state_lock:
+                if generation == self.generation:
+                    self.analysis_count += 1
+                    self.analysis_seconds += max(0, time.monotonic() - started)
+                    self.active_analysis_started = None
 
     def run(self):
         while not self.stop.is_set():
