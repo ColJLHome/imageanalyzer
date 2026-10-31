@@ -260,6 +260,61 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.index.search()['total'], 1)
         self.assertEqual(self.index.search()['items'][0]['path'], str(copied))
 
+    def test_scan_orders_all_folders_by_name_size_and_creation_in_both_directions(self):
+        self.file.unlink()
+        paths = [self.root / 'zeta.png', self.root / 'nested' / 'Alpha.png', self.root / 'middle.png']
+        for path, size in zip(paths, (5, 10, 15)):
+            path.write_bytes(b'x' * size)
+        births = dict(zip(paths, (300, 100, 200)))
+        expected = {'name': [paths[1], paths[2], paths[0]],
+                    'size': paths, 'created': [paths[1], paths[2], paths[0]]}
+        for by in ('name', 'size', 'created'):
+            for direction in ('asc', 'desc'):
+                with self.subTest(by=by, direction=direction):
+                    self.index.config.update(scan_sort_by=by, scan_sort_direction=direction)
+                    with patch.object(self.index, 'process') as process, \
+                         patch('imageanalyser.core.creation_time_ns', side_effect=lambda path, metadata: (births[path], False)):
+                        self.index.scan()
+                    actual = [call.args[0] for call in process.call_args_list]
+                    self.assertEqual(actual, expected[by] if direction == 'asc' else list(reversed(expected[by])))
+
+    def test_scan_order_settings_validate_and_persist(self):
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        settings = client.get('/api/settings').json()
+        self.assertEqual(settings['scan_sort_by'], 'name')
+        for invalid in ({'scan_sort_by': 'other'}, {'scan_sort_direction': 'other'}):
+            self.assertEqual(client.put('/api/settings', json={**settings, **invalid}).status_code, 422)
+        saved = {**settings, 'scan_sort_by': 'created', 'scan_sort_direction': 'desc'}
+        self.assertEqual(client.put('/api/settings', json=saved).status_code, 200)
+        restarted = Index(self.config)
+        self.addCleanup(restarted.log_handler.close)
+        self.assertEqual(restarted.get_settings(), saved)
+
+    def test_creation_time_uses_birth_time_and_explicit_mtime_fallback(self):
+        from types import SimpleNamespace
+        from imageanalyser.file_order import creation_time_ns
+        import struct
+        metadata = SimpleNamespace(st_mtime_ns=999, st_ctime_ns=12345)
+        with patch('imageanalyser.file_order._statx', None):
+            self.assertEqual(creation_time_ns(self.file, metadata), (999, True))
+            self.assertEqual(creation_time_ns(self.file, SimpleNamespace(st_birthtime_ns=123, st_mtime_ns=999)), (123, False))
+        def fake_statx(directory, path, flags, mask, buffer):
+            struct.pack_into('=I', buffer, 0, 0x800)
+            struct.pack_into('=qI', buffer, 0x50, 123, 456)
+            return 0
+        with patch('imageanalyser.file_order._statx', side_effect=fake_statx):
+            self.assertEqual(creation_time_ns(self.file, metadata), (123_000_000_456, False))
+        with patch('imageanalyser.file_order._statx', return_value=-1):
+            self.assertEqual(creation_time_ns(self.file, metadata), (999, True))
+
+    def test_sort_keeps_missing_files_at_end(self):
+        missing = self.root / 'missing.png'
+        for direction in ('asc', 'desc'):
+            ordered = self.index.order_candidates([missing, self.file], 'size', direction, lambda: False)
+            self.assertEqual(ordered, [self.file, missing])
+
     def test_scan_progress_counts_checked_and_remaining_including_skips(self):
         second = self.root / 'second.png'
         Image.new('RGB', (30, 30), 'blue').save(second)

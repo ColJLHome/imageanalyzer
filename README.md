@@ -41,6 +41,12 @@ Settings saved through the screen are stored in the local SQLite database and ov
 
 Changing the model field selects the name/alias sent with requests; model installation and loading are managed by llama-server. Existing completed analyses are retained. To rebuild them with the new model, clear the image index and scan again. Records from removed folders remain searchable, while their previews are blocked because they are outside the configured roots.
 
+### Analysis order
+
+Settings includes **Analyse files in order of** (name, date created, or file size) and **Order** (ascending or descending). The default is name ascending. Name sorting is case-insensitive; date ascending means oldest first and size ascending means smallest first. Ordering is global across all configured roots, with filenames and full paths breaking ties deterministically. Unreadable files are checked last and reported in the logs. Saving a new order switches the scanner to that order after any active analysis finishes; completed files remain indexed and are skipped.
+
+Date created uses the filesystem birth timestamp, including Linux `statx` where supported. Some network shares and filesystems do not supply one; those files use modification time, and the fallback count is logged. Linux inode-change time (`ctime`) is never used as creation time.
+
 ## Database backup and restore
 
 In **Settings → Database backup and restore**, select **Download database backup** to save a consistent SQLite snapshot, even while scanning. Backups include image records, analyses, hashes, exclusions, and database settings. Original images, logs, `config.json`, and environment API keys are not included.

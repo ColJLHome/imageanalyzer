@@ -17,6 +17,7 @@ import httpx
 from PIL import Image, ImageOps
 
 from .settings import RuntimeSettings
+from .file_order import creation_time_ns
 
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff', '.gif'}
 PROMPT = '''Describe only what is visibly present. Return one JSON object with:
@@ -370,12 +371,37 @@ class Index:
             raise ValueError(f'Invalid model answer (finish_reason={str(finish)[:80]}): {exc}') from exc
         return result, palette, width, height
 
+    def order_candidates(self, candidates, sort_by, direction, interrupted):
+        ordered, unavailable, fallbacks = [], [], 0
+        for path in candidates:
+            if interrupted():
+                return []
+            tie = (path.name.casefold(), str(path))
+            try:
+                if sort_by == 'size':
+                    primary = path.stat().st_size
+                elif sort_by == 'created':
+                    primary, fallback = creation_time_ns(path, path.stat())
+                    fallbacks += int(fallback)
+                else:
+                    primary = path.name.casefold()
+                ordered.append(((primary, *tie), path))
+            except OSError as exc:
+                self.log.warning('Cannot read sort metadata for %s: %s', path, exc)
+                unavailable.append(path)
+        if fallbacks:
+            self.log.info('Creation date unavailable for %s images; using modification time', fallbacks)
+        ordered.sort(key=lambda item: item[0], reverse=direction == 'desc')
+        return [path for _, path in ordered] + sorted(unavailable, key=str)
+
     def scan(self):
         if self.paused or not self.scan_lock.acquire(blocking=False):
             return
         with self.control_lock:
             scan_generation = self.generation
             roots = list(self.roots)
+            sort_by = self.config.get('scan_sort_by', 'name')
+            sort_direction = self.config.get('scan_sort_direction', 'asc')
         with self.state_lock:
             self.reset_analysis_timing()
             self.state.update(running=True, roots={}, progress={
@@ -414,7 +440,10 @@ class Index:
                 for error in errors:
                     self.log.warning('Folder traversal failed: %s', error)
             # Overlapping configured roots should not count the same path twice.
-            candidates = list(dict.fromkeys(candidates))
+            candidates = self.order_candidates(list(dict.fromkeys(candidates)), sort_by, sort_direction, interrupted)
+            if interrupted():
+                return
+            self.log.info('Scan order: %s %s', sort_by, sort_direction)
             with self.state_lock:
                 if scan_generation == self.generation:
                     self.state['progress'].update(phase='scanning', total=len(candidates), discovered=len(candidates))

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -13,6 +14,8 @@ class RuntimeSettings(BaseModel):
     request_timeout_seconds: int = Field(default=180, ge=1, le=3600)
     max_output_tokens: int = Field(default=2048, ge=128, le=32768)
     enable_thinking: bool = False
+    scan_sort_by: Literal['created', 'size', 'name'] = 'name'
+    scan_sort_direction: Literal['asc', 'desc'] = 'asc'
 
     @field_validator('llama_url')
     @classmethod
