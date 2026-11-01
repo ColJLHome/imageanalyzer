@@ -33,6 +33,12 @@ The **Scanner details** tab shows current activity, folder status, and recent er
 
 The **Logs** tab refreshes every five seconds while open and shows scanner events, image analysis durations, unavailable roots, and exception tracebacks. Filter by **Problems** (errors and warnings), **Errors**, **Warnings**, **Successes**, or **General activity**, and search by message text or image path. Filters search the retained rotations before selecting the latest 300 matching events, so noisy success messages do not hide older failures. Tracebacks remain attached to their error event. **Copy logs** copies only the displayed matching events. Event colours distinguish severity and success. Logs are written to `data_dir/imageanalyser.log`, with three rotating backups of up to 2 MB each. The tab displays up to 300 complete matching events across the current file and three backups, reading at most about 8.4 MB per refresh. Clearing images retains diagnostic logs. These are application logs; llama-server's own GPU and inference logs remain in its console or service journal.
 
+## Scan badges
+
+Each image card starts with badges for completed **OpenCLIP**, **A1111**, **RAM++**, and **llama-server** stages. Hover, keyboard-focus, or tap a badge to see its stored data in a scrollable tooltip. OpenCLIP loads its full vector on demand; the others show saved generation metadata, recognition tags, or the complete description/people analysis and model identity. Press Escape to close the tooltip. Auto-refresh waits while a tooltip is open so you can read and scroll it.
+
+**A1111 (none)** means metadata was checked but none is currently saved. A missing badge means no result is stored for that stage. Manually entered descriptions do not count as completed llama-server analysis; corrected outputs and stored results from older model settings are labelled in the tooltip.
+
 ## Sorting the main page
 
 The Images tab defaults to **Last tagged or indexed → Newest first**. Use **Sort by** to select **Date created**, **Image name**, or **Search relevance**, and use the Order selector or **Reverse order** button to invert the result order. Sorting applies to the whole filtered result set before pagination. Choose Search relevance when you want visual/combined search ranked primarily by similarity rather than date or name.

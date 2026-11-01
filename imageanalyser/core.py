@@ -21,6 +21,7 @@ from .file_order import creation_time_ns
 from .metadata import read_a1111_metadata, parse_a1111_text
 from .embeddings import OpenClipEncoder, OpenClipError, model_key, rank_vectors
 from .diagnostics import CategoryFilter, read_events
+from .scan_status import completed_scans
 from .recognition import RecognizeAnything, RecognitionError, recognition_key, validate_recognition_data
 
 ANALYSIS_VERSION = 1
@@ -181,9 +182,14 @@ class Index:
                                    ('ram_error', 'TEXT'), ('ram_retry_at', 'REAL NOT NULL DEFAULT 0'),
                                    ('ram_manually_edited', 'INTEGER NOT NULL DEFAULT 0'),
                                    ('last_indexed_at', 'REAL'), ('created_at_ns', 'INTEGER'),
-                                   ('creation_date_fallback', 'INTEGER')]:
+                                   ('creation_date_fallback', 'INTEGER'), ('a1111_sha256', 'TEXT')]:
             if column not in columns:
                 db.execute(f'ALTER TABLE images ADD COLUMN {column} {definition}')
+        if 'a1111_sha256' not in columns:
+            db.execute("""UPDATE images SET a1111_sha256=sha256 WHERE sha256 IS NOT NULL AND (
+                a1111_metadata IS NOT NULL OR (image_embedding IS NOT NULL AND embedding_sha256=sha256)
+                OR (ram_data IS NOT NULL AND ram_sha256=sha256)
+                OR (model IS NOT NULL AND analysis_version>=? AND manually_edited=0))""", (ANALYSIS_VERSION,))
         if 'last_indexed_at' not in columns:
             db.execute("UPDATE images SET last_indexed_at=updated WHERE status='done'")
         db.execute('CREATE INDEX IF NOT EXISTS images_last_indexed ON images(last_indexed_at)')
@@ -206,7 +212,7 @@ class Index:
         return db.execute("DELETE FROM images WHERE path GLOB '*/.*/*'").rowcount
 
     @staticmethod
-    def mark_indexed(db, path, metadata=None):
+    def mark_indexed(db, path, metadata=None, metadata_checked=True):
         created = fallback = None
         try:
             created, fallback = creation_time_ns(path, metadata or path.stat())
@@ -214,8 +220,9 @@ class Index:
             pass
         db.execute("""UPDATE images SET last_indexed_at=updated,
             created_at_ns=coalesce(?,created_at_ns),
-            creation_date_fallback=CASE WHEN ? IS NULL THEN creation_date_fallback ELSE ? END
-            WHERE path=? AND status='done'""", (created, created, fallback, str(path)))
+            creation_date_fallback=CASE WHEN ? IS NULL THEN creation_date_fallback ELSE ? END,
+            a1111_sha256=CASE WHEN ? THEN sha256 ELSE a1111_sha256 END
+            WHERE path=? AND status='done'""", (created, created, fallback, metadata_checked, str(path)))
 
     def ensure_creation_dates(self):
         with self.control_lock:
@@ -394,7 +401,7 @@ class Index:
                     manually_edited=1,palette=coalesce(palette,'[]'),analysis_version=?,error=NULL,retry_at=0,attempts=0,updated=? WHERE id=?""",
                     (json.dumps(result), self.search_text(Path(row['path']), result, metadata, ram_data),
                      json.dumps(metadata) if metadata else None, ANALYSIS_VERSION, time.time(), image_id))
-                self.mark_indexed(db, Path(row['path']))
+                self.mark_indexed(db, Path(row['path']), metadata_checked=False)
         self.log.info('Image data manually corrected: %s', row['path'])
         return True
 
@@ -930,10 +937,12 @@ class Index:
                     return
         # Stream files without holding the control lock while reading network storage.
         digest = self.hash_file(path)
+        metadata_checked = True
         try:
             metadata = read_a1111_metadata(path)
         except (OSError, ValueError, SyntaxError) as exc:
             self.log.warning('Could not read A1111 metadata for %s: %s', path, exc)
+            metadata_checked = False
             metadata = None
         metadata_json = json.dumps(metadata) if metadata else None
         after_hash = path.stat()
@@ -971,7 +980,7 @@ class Index:
                         (str(path), stat.st_size, stat.st_mtime_ns, digest, cached['analysis'],
                          self.search_text(path, result, metadata, self.ram_for_hash(row, digest)), cached['palette'], cached['width'],
                          cached['height'], cached['model'], time.time(), metadata_json, ANALYSIS_VERSION,cached['manually_edited']))
-                    self.mark_indexed(db, path, stat)
+                    self.mark_indexed(db, path, stat, metadata_checked)
                     self.log.info('Reused analysis by SHA-256: %s (from %s)', path, cached['path'])
                     return
                 if unchanged and row['retry_at'] > time.time():
@@ -1010,7 +1019,7 @@ class Index:
                     if not updated.rowcount:
                         self.log.info('Discarded analysis for removed image: %s', path)
                         return
-                    self.mark_indexed(db, path, stat)
+                    self.mark_indexed(db, path, stat, metadata_checked)
             self.log.info('Indexed image in %.1fs: %s', time.monotonic() - started, path)
         except Exception as exc:
             self.log.exception('Analysis failed for %s', path)
@@ -1054,6 +1063,7 @@ class Index:
         }[sort_by]
         with self.control_lock:
             config = dict(self.config)
+        clip_key, ram_key = model_key(config), recognition_key(config)
         enabled = config.get('analysis_backend', 'llama') in ('openclip', 'hybrid')
         if mode == 'semantic' and not enabled:
             raise OpenClipError('Select OpenCLIP or Both in Settings to enable semantic search')
@@ -1101,7 +1111,7 @@ class Index:
                     ids.reverse()
                 rows = [by_id[image_id] for image_id in ids[offset:offset+limit]]
         return {'total': total, 'search_mode': mode, 'sort_by': sort_by, 'direction': direction, 'items': [dict(
-            id=r['id'], path=r['path'], last_indexed_at=r['last_indexed_at'],
+            id=r['id'], path=r['path'], scans=completed_scans(r, clip_key, ram_key), last_indexed_at=r['last_indexed_at'],
             created_at=r['created_at_ns']/1_000_000_000 if r['created_at_ns'] is not None else None,
             creation_date_fallback=bool(r['creation_date_fallback']) if r['creation_date_fallback'] is not None else None, width=r['width'], height=r['height'],
             analysis=json.loads(r['analysis']), palette=json.loads(r['palette']),
