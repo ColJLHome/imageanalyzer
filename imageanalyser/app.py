@@ -134,9 +134,11 @@ def create_app(config, restart_callback=None):
     @app.get('/api/search')
     def search(q: str = Query('', max_length=500), scene: str = '', object: str = '', colour: str = '',
                offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=100),
-               mode: Literal['keyword', 'semantic', 'hybrid'] = 'keyword'):
+               mode: Literal['keyword', 'semantic', 'hybrid'] = 'keyword',
+               sort_by: Literal['updated', 'created', 'name', 'relevance'] = 'relevance',
+               direction: Literal['asc', 'desc'] = 'desc'):
         try:
-            return index.search(q, scene, object, colour, offset, limit, mode)
+            return index.search(q, scene, object, colour, offset, limit, mode, sort_by, direction)
         except OpenClipError as exc:
             index.log.exception('OpenCLIP search failed')
             raise HTTPException(503, str(exc))
@@ -145,6 +147,7 @@ def create_app(config, restart_callback=None):
     def status():
         with index.connect() as db:
             counts = dict(db.execute("SELECT status,count(*) FROM images WHERE status!='removed' GROUP BY status").fetchall())
+            latest_indexed = db.execute("SELECT max(last_indexed_at) FROM images WHERE status='done'").fetchone()[0]
             embedded = db.execute("""SELECT count(*) FROM images WHERE status='done' AND image_embedding IS NOT NULL
                 AND embedding_model=? AND embedding_sha256=sha256""", (model_key(index.config),)).fetchone()[0]
             recognized = db.execute("""SELECT count(*) FROM images WHERE status='done' AND ram_data IS NOT NULL
@@ -155,7 +158,7 @@ def create_app(config, restart_callback=None):
                 "SELECT path,coalesce(ram_error,embedding_error,error) AS error FROM images WHERE (status='error' OR ram_error IS NOT NULL OR embedding_error IS NOT NULL OR error IS NOT NULL) AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
                 (since, since))]
         with index.state_lock:
-            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'embedding_count': embedded, 'recognition_count': recognized, 'recognize_enabled': index.config.get('recognize_enabled', False), 'analysis_backend': index.config.get('analysis_backend', 'llama'), 'errors': errors}
+            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'latest_indexed_at': latest_indexed, 'embedding_count': embedded, 'recognition_count': recognized, 'recognize_enabled': index.config.get('recognize_enabled', False), 'analysis_backend': index.config.get('analysis_backend', 'llama'), 'errors': errors}
 
     @app.post('/api/scanner/details/clear')
     def clear_scanner_details(body: ClearRequest):

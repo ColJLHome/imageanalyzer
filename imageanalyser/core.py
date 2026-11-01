@@ -179,9 +179,15 @@ class Index:
                                    ('manually_edited', 'INTEGER NOT NULL DEFAULT 0'),
                                    ('ram_data', 'TEXT'), ('ram_model', 'TEXT'), ('ram_sha256', 'TEXT'),
                                    ('ram_error', 'TEXT'), ('ram_retry_at', 'REAL NOT NULL DEFAULT 0'),
-                                   ('ram_manually_edited', 'INTEGER NOT NULL DEFAULT 0')]:
+                                   ('ram_manually_edited', 'INTEGER NOT NULL DEFAULT 0'),
+                                   ('last_indexed_at', 'REAL'), ('created_at_ns', 'INTEGER'),
+                                   ('creation_date_fallback', 'INTEGER')]:
             if column not in columns:
                 db.execute(f'ALTER TABLE images ADD COLUMN {column} {definition}')
+        if 'last_indexed_at' not in columns:
+            db.execute("UPDATE images SET last_indexed_at=updated WHERE status='done'")
+        db.execute('CREATE INDEX IF NOT EXISTS images_last_indexed ON images(last_indexed_at)')
+        db.execute('CREATE INDEX IF NOT EXISTS images_created_at ON images(created_at_ns)')
         db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
         db.execute('CREATE INDEX IF NOT EXISTS images_embedding_hash ON images(embedding_model,embedding_sha256)')
         db.execute('CREATE INDEX IF NOT EXISTS images_ram_hash ON images(ram_sha256,ram_model)')
@@ -198,6 +204,38 @@ class Index:
     def purge_excluded_images(db):
         # The final slash ensures a dot-prefixed filename alone is not a folder exclusion.
         return db.execute("DELETE FROM images WHERE path GLOB '*/.*/*'").rowcount
+
+    @staticmethod
+    def mark_indexed(db, path, metadata=None):
+        created = fallback = None
+        try:
+            created, fallback = creation_time_ns(path, metadata or path.stat())
+        except (OSError, ValueError):
+            pass
+        db.execute("""UPDATE images SET last_indexed_at=updated,
+            created_at_ns=coalesce(?,created_at_ns),
+            creation_date_fallback=CASE WHEN ? IS NULL THEN creation_date_fallback ELSE ? END
+            WHERE path=? AND status='done'""", (created, created, fallback, str(path)))
+
+    def ensure_creation_dates(self):
+        with self.control_lock:
+            generation = self.generation
+            with self.connect() as db:
+                paths = [r['path'] for r in db.execute(
+                    "SELECT path FROM images WHERE status='done' AND created_at_ns IS NULL")]
+        updates = []
+        for value in paths:
+            try:
+                path = self.permitted(value)
+                created, fallback = creation_time_ns(path, path.stat())
+                updates.append((created, fallback, value))
+            except (OSError, ValueError):
+                continue
+        with self.control_lock:
+            if generation == self.generation and updates:
+                with self.connect() as db:
+                    db.executemany("""UPDATE images SET created_at_ns=?,creation_date_fallback=?
+                        WHERE path=? AND status='done' AND created_at_ns IS NULL""", updates)
 
     def reset_analysis_timing(self):
         self.analysis_count = 0
@@ -356,6 +394,7 @@ class Index:
                     manually_edited=1,palette=coalesce(palette,'[]'),analysis_version=?,error=NULL,retry_at=0,attempts=0,updated=? WHERE id=?""",
                     (json.dumps(result), self.search_text(Path(row['path']), result, metadata, ram_data),
                      json.dumps(metadata) if metadata else None, ANALYSIS_VERSION, time.time(), image_id))
+                self.mark_indexed(db, Path(row['path']))
         self.log.info('Image data manually corrected: %s', row['path'])
         return True
 
@@ -414,6 +453,7 @@ class Index:
     def connect(self):
         db = sqlite3.connect(self.database, timeout=30)
         db.row_factory = sqlite3.Row
+        db.create_function('image_name', 1, lambda path: str(path).rsplit('/', 1)[-1].casefold(), deterministic=True)
         try:
             with db:
                 yield db
@@ -743,6 +783,7 @@ class Index:
                          caption_source['model'] if preserve else None, time.time(), metadata_json,
                          caption_source['analysis_version'] if preserve else 0, vector, key, digest,
                          caption_source['manually_edited'] if preserve else 0))
+                    self.mark_indexed(db, path, stat)
             self.log.info('OpenCLIP %s: %s', 'hash reused' if cached else 'indexed', path)
         except Exception as exc:
             self.log.exception('OpenCLIP failed for %s', path)
@@ -838,6 +879,7 @@ class Index:
                          previous['analysis_version'] if preserve else 0, previous['manually_edited'] if preserve else 0,
                          json.dumps(data), cached['ram_model'] if cached else key, digest,
                          cached['ram_manually_edited'] if cached else 0))
+                    self.mark_indexed(db, path, stat)
             self.log.info('RAM++ %s: %s', 'hash reused' if cached else 'indexed', path)
         except Exception as exc:
             self.log.exception('RAM++ failed for %s', path)
@@ -929,6 +971,7 @@ class Index:
                         (str(path), stat.st_size, stat.st_mtime_ns, digest, cached['analysis'],
                          self.search_text(path, result, metadata, self.ram_for_hash(row, digest)), cached['palette'], cached['width'],
                          cached['height'], cached['model'], time.time(), metadata_json, ANALYSIS_VERSION,cached['manually_edited']))
+                    self.mark_indexed(db, path, stat)
                     self.log.info('Reused analysis by SHA-256: %s (from %s)', path, cached['path'])
                     return
                 if unchanged and row['retry_at'] > time.time():
@@ -967,6 +1010,7 @@ class Index:
                     if not updated.rowcount:
                         self.log.info('Discarded analysis for removed image: %s', path)
                         return
+                    self.mark_indexed(db, path, stat)
             self.log.info('Indexed image in %.1fs: %s', time.monotonic() - started, path)
         except Exception as exc:
             self.log.exception('Analysis failed for %s', path)
@@ -993,9 +1037,21 @@ class Index:
                 self.log.exception('Scanner failed; will retry on next scan')
             self.wake.wait(self.config.get('scan_interval_seconds', 3600))
 
-    def search(self, q='', scene='', object_name='', colour='', offset=0, limit=60, mode='keyword'):
+    def search(self, q='', scene='', object_name='', colour='', offset=0, limit=60, mode='keyword',
+               sort_by='relevance', direction='desc'):
         if mode not in ('keyword', 'semantic', 'hybrid'):
             raise ValueError('Unknown search mode')
+        if sort_by not in ('updated', 'created', 'name', 'relevance') or direction not in ('asc', 'desc'):
+            raise ValueError('Unknown result sort order')
+        if sort_by == 'created':
+            self.ensure_creation_dates()
+        sql_direction = 'ASC' if direction == 'asc' else 'DESC'
+        order = {
+            'updated': f'last_indexed_at IS NULL, last_indexed_at {sql_direction}, id {sql_direction}',
+            'created': f'created_at_ns IS NULL, created_at_ns {sql_direction}, image_name(path) {sql_direction}, id {sql_direction}',
+            'name': f'image_name(path) {sql_direction}, path {sql_direction}, id {sql_direction}',
+            'relevance': 'last_indexed_at IS NULL, last_indexed_at DESC, id DESC',
+        }[sort_by]
         with self.control_lock:
             config = dict(self.config)
         enabled = config.get('analysis_backend', 'llama') in ('openclip', 'hybrid')
@@ -1018,10 +1074,10 @@ class Index:
         with self.connect() as db:
             if mode == 'keyword':
                 total = db.execute('SELECT count(*) FROM images WHERE ' + where, params).fetchone()[0]
-                rows = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?',
+                rows = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY ' + order + ' LIMIT ? OFFSET ?',
                                   [*params, limit, offset]).fetchall()
             else:
-                candidates = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY id DESC', params).fetchall()
+                candidates = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY ' + order, params).fetchall()
                 vectors = [r for r in candidates if r['image_embedding'] and r['embedding_model'] == model_key(config)
                            and r['embedding_sha256'] == r['sha256']]
                 ranked = rank_vectors(vectors, self.encoder.text(q, config)) if vectors else []
@@ -1038,9 +1094,16 @@ class Index:
                     ids = sorted(fused, key=lambda image_id: (-fused[image_id], image_id))
                 total = len(ids)
                 by_id = {r['id']: r for r in candidates}
+                if sort_by != 'relevance':
+                    eligible = set(ids)
+                    ids = [row['id'] for row in candidates if row['id'] in eligible]
+                elif direction == 'asc':
+                    ids.reverse()
                 rows = [by_id[image_id] for image_id in ids[offset:offset+limit]]
-        return {'total': total, 'search_mode': mode, 'items': [dict(
-            id=r['id'], path=r['path'], width=r['width'], height=r['height'],
+        return {'total': total, 'search_mode': mode, 'sort_by': sort_by, 'direction': direction, 'items': [dict(
+            id=r['id'], path=r['path'], last_indexed_at=r['last_indexed_at'],
+            created_at=r['created_at_ns']/1_000_000_000 if r['created_at_ns'] is not None else None,
+            creation_date_fallback=bool(r['creation_date_fallback']) if r['creation_date_fallback'] is not None else None, width=r['width'], height=r['height'],
             analysis=json.loads(r['analysis']), palette=json.loads(r['palette']),
             a1111_metadata=json.loads(r['a1111_metadata']) if r['a1111_metadata'] else None,
             embedded=bool(r['image_embedding'] and r['embedding_model'] == model_key(config)
