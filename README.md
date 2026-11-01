@@ -51,6 +51,8 @@ The initial default model is `ViT-B-32` with `laion2b_s34b_b79k` weights. First 
 hf download laion/CLIP-ViT-B-32-laion2B-s34B-b79K open_clip_pytorch_model.bin open_clip_config.json
 ```
 
+Hover over an image's **OpenCLIP** badge (or focus it with the keyboard) to see a scrollable tooltip with the full stored vector, model/weights identity, dimensions, image hash, validation flags, and the current search similarity score when available. Data is loaded on demand rather than included in every search response. The tooltip stays open while you move into it to scroll, and Escape dismisses it.
+
 Search modes are **Visual similarity** (rank image embeddings against the query), **Keywords and metadata** (the existing text match), and **Combined search** (reciprocal-rank fusion of both). Visual scores are cosine similarity, not probabilities or confirmed detections. Semantic ranking returns indexed images by relevance, including low-scoring results; it does not require literal tag matches. Scene/object/colour filters still use stored llama-server tags, so they may exclude images that only have embeddings. Combined search falls back to keywords when the selected backend does not enable OpenCLIP. Existing captions, people details, metadata, backups, and exclusions are retained. OpenCLIP does not generate new person descriptions; those appear during the later llama-server pass.
 
 ## A1111 generation metadata

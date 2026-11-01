@@ -4,6 +4,8 @@ import io
 import json
 import logging
 import sqlite3
+import struct
+import math
 from pathlib import Path
 import threading
 import tempfile
@@ -190,6 +192,33 @@ def create_app(config, restart_callback=None):
         if not index.remove_image(image_id):
             raise HTTPException(404, 'Image not found in index')
         return {'removed': True}
+
+    @app.get('/api/images/{image_id}/openclip')
+    def openclip_details(image_id: int):
+        with index.connect() as db:
+            row = db.execute("SELECT * FROM images WHERE id=? AND status!='removed'", (image_id,)).fetchone()
+        if not row or not row['image_embedding']:
+            raise HTTPException(404, 'No OpenCLIP embedding is stored for this image')
+        raw = row['image_embedding']
+        if not isinstance(raw, bytes) or len(raw) % 4 or len(raw) > 65536:
+            raise HTTPException(409, 'The stored OpenCLIP vector is invalid; rescan this image')
+        vector = list(struct.unpack('<' + 'f' * (len(raw) // 4), raw))
+        if any(not math.isfinite(value) for value in vector):
+            raise HTTPException(409, 'The stored OpenCLIP vector is invalid; rescan this image')
+        architecture = weights = None
+        try:
+            stored = json.loads((row['embedding_model'] or '').removeprefix('openclip-v1:'))
+            if isinstance(stored, list) and len(stored) == 2:
+                architecture, weights = stored
+        except (ValueError, TypeError):
+            pass
+        return {'image_id': image_id, 'model': architecture, 'pretrained_weights': weights,
+                'model_key': row['embedding_model'], 'dimensions': len(vector),
+                'format': 'normalized float32, little-endian', 'sha256': row['embedding_sha256'],
+                'matches_file_hash': row['embedding_sha256'] == row['sha256'],
+                'matches_current_model': row['embedding_model'] == model_key(index.config),
+                'image_sha256': row['sha256'], 'last_error': row['embedding_error'],
+                'retry_at': row['embedding_retry_at'] or None, 'embedding': vector}
 
     @app.get('/api/images/{image_id}/thumbnail')
     def thumbnail(image_id: int):

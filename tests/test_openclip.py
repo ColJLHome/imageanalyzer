@@ -186,6 +186,48 @@ class OpenClipTests(unittest.TestCase):
         self.assertTrue(moved_item['manually_edited'])
         self.assertIn('555', moved_item['a1111_metadata']['raw'])
 
+    def test_tooltip_endpoint_returns_full_vector_without_model_inference(self):
+        from fastapi.testclient import TestClient
+        from imageanalyser.app import create_app
+        self.index.scan()
+        image_id = self.index.search('red')['items'][0]['id']
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        with patch.object(app.state.index.encoder, 'load') as load:
+            response = client.get(f'/api/images/{image_id}/openclip')
+            load.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data['embedding'], [1.0, 0.0])
+        self.assertEqual(data['dimensions'], 2)
+        self.assertEqual(data['model'], 'ViT-B-32')
+        self.assertEqual(data['pretrained_weights'], 'laion2b_s34b_b79k')
+        self.assertTrue(data['matches_current_model'])
+        self.assertTrue(data['matches_file_hash'])
+        self.assertEqual(data['sha256'], self.index.hash_file(self.red))
+        app.state.index.config['openclip_pretrained'] = 'other-weights'
+        self.assertFalse(client.get(f'/api/images/{image_id}/openclip').json()['matches_current_model'])
+        self.assertEqual(client.get('/api/images/99999/openclip').status_code, 404)
+        self.index.remove_image(image_id)
+        self.assertEqual(client.get(f'/api/images/{image_id}/openclip').status_code, 404)
+
+    def test_tooltip_rejects_invalid_vectors(self):
+        from fastapi.testclient import TestClient
+        from imageanalyser.app import create_app
+        self.index.scan()
+        image_id = self.index.search('red')['items'][0]['id']
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        for raw in (b'x', vector(float('nan'), 0)):
+            with self.index.connect() as db:
+                db.execute('UPDATE images SET image_embedding=? WHERE id=?', (raw, image_id))
+            self.assertEqual(client.get(f'/api/images/{image_id}/openclip').status_code, 409)
+        with self.index.connect() as db:
+            db.execute('UPDATE images SET image_embedding=NULL WHERE id=?', (image_id,))
+        self.assertEqual(client.get(f'/api/images/{image_id}/openclip').status_code, 404)
+
     def test_backup_restores_embeddings_and_rejects_incompatible_search_mode(self):
         self.index.scan()
         backup = self.index.backup_database()
