@@ -20,6 +20,7 @@ from .settings import RuntimeSettings
 from .file_order import creation_time_ns
 from .metadata import read_a1111_metadata, parse_a1111_text
 from .embeddings import OpenClipEncoder, OpenClipError, model_key, rank_vectors
+from .diagnostics import CategoryFilter, read_events
 
 ANALYSIS_VERSION = 1
 
@@ -132,7 +133,8 @@ class Index:
         self.log.parent = logging.getLogger('imageanalyser')
         self.log.setLevel(logging.INFO)
         self.log_handler = RotatingFileHandler(self.log_path, maxBytes=2_000_000, backupCount=3, encoding='utf-8')
-        self.log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        self.log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(category)s] %(message)s'))
+        self.log_handler.addFilter(CategoryFilter())
         self.log.addHandler(self.log_handler)
         self.control_lock = threading.RLock()
         self.generation = 0
@@ -360,6 +362,9 @@ class Index:
             self.resume()
             self.log.info('Scan for new images requested by user')
             return 'queued'
+
+    def log_events(self, limit=300, category='all', query=''):
+        return read_events(self.log_path, limit, category, query)
 
     def logs(self, limit=300):
         # Bound disk reads and responses even when the log file is large.

@@ -170,8 +170,10 @@ def create_app(config, restart_callback=None):
         return {'paused': False}
 
     @app.get('/api/logs')
-    def logs(limit: int = Query(300, ge=1, le=1000)):
-        return {'lines': index.logs(limit)}
+    def logs(limit: int = Query(300, ge=1, le=1000),
+             category: Literal['all', 'problems', 'error', 'warning', 'success', 'activity'] = 'all',
+             q: str = Query('', max_length=500)):
+        return index.log_events(limit, category, q)
 
     @app.put('/api/images/{image_id}')
     def edit_image(image_id: int, body: ImageEditRequest):
