@@ -21,6 +21,7 @@ from .file_order import creation_time_ns
 from .metadata import read_a1111_metadata, parse_a1111_text
 from .embeddings import OpenClipEncoder, OpenClipError, model_key, rank_vectors
 from .diagnostics import CategoryFilter, read_events
+from .recognition import RecognizeAnything, RecognitionError, recognition_key, validate_recognition_data
 
 ANALYSIS_VERSION = 1
 
@@ -139,6 +140,7 @@ class Index:
         self.control_lock = threading.RLock()
         self.generation = 0
         self.encoder = OpenClipEncoder()
+        self.recognizer = RecognizeAnything()
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.scan_lock = threading.Lock()
@@ -174,11 +176,15 @@ class Index:
                                    ('image_embedding', 'BLOB'), ('embedding_model', 'TEXT'),
                                    ('embedding_sha256', 'TEXT'), ('embedding_error', 'TEXT'),
                                    ('embedding_retry_at', 'REAL NOT NULL DEFAULT 0'),
-                                   ('manually_edited', 'INTEGER NOT NULL DEFAULT 0')]:
+                                   ('manually_edited', 'INTEGER NOT NULL DEFAULT 0'),
+                                   ('ram_data', 'TEXT'), ('ram_model', 'TEXT'), ('ram_sha256', 'TEXT'),
+                                   ('ram_error', 'TEXT'), ('ram_retry_at', 'REAL NOT NULL DEFAULT 0'),
+                                   ('ram_manually_edited', 'INTEGER NOT NULL DEFAULT 0')]:
             if column not in columns:
                 db.execute(f'ALTER TABLE images ADD COLUMN {column} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
         db.execute('CREATE INDEX IF NOT EXISTS images_embedding_hash ON images(embedding_model,embedding_sha256)')
+        db.execute('CREATE INDEX IF NOT EXISTS images_ram_hash ON images(ram_sha256,ram_model)')
 
     @staticmethod
     def excluded_directory(path):
@@ -204,7 +210,7 @@ class Index:
             average = self.analysis_seconds / self.analysis_count if self.analysis_count else None
             remaining = max(0, progress['total'] - progress['scanned']) if progress['total'] is not None else None
             estimate = None
-            if progress['phase'] in ('scanning', 'embedding', 'complete') and remaining is not None:
+            if progress['phase'] in ('scanning', 'embedding', 'recognizing', 'complete') and remaining is not None:
                 if remaining == 0:
                     estimate = 0.0
                 elif average is not None:
@@ -260,7 +266,9 @@ class Index:
             restored_config = {**self.base_config, **(RuntimeSettings.model_validate_json(saved['value']).model_dump() if saved else {})}
             restored_settings = RuntimeSettings(**{key: restored_config[key] for key in RuntimeSettings.model_fields
                                                   if key in restored_config})
-            for row in source.execute('SELECT status,analysis,palette FROM images'):
+            for row in source.execute('SELECT * FROM images'):
+                if 'ram_data' in columns and row['ram_data']:
+                    validate_recognition_data(json.loads(row['ram_data']))
                 if row['status'] not in ('pending', 'done', 'error', 'removed'):
                     raise ValueError('Backup contains an invalid image status')
                 if row['status'] == 'done':
@@ -303,7 +311,7 @@ class Index:
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('runtime_config', ?)",
                            (json.dumps(values),))
                 db.execute("UPDATE images SET retry_at=0,attempts=0 WHERE status='error'")
-                db.execute('UPDATE images SET embedding_retry_at=0,embedding_error=NULL')
+                db.execute('UPDATE images SET embedding_retry_at=0,embedding_error=NULL,ram_retry_at=0,ram_error=NULL')
             self.config = {**self.config, **values}
             self.roots = [Path(p) for p in values['roots']]
             self.generation += 1
@@ -327,17 +335,26 @@ class Index:
         self.log.info('Cleared %s image records; scanning paused until Resume scanning', count)
         return count
 
-    def edit_image(self, image_id, analysis, metadata_raw):
+    def edit_image(self, image_id, analysis, metadata_raw, ram_tags=None):
         result = parse_analysis(json.dumps(analysis))
         metadata = parse_a1111_text(metadata_raw)
         with self.control_lock:
             with self.connect() as db:
-                row = db.execute("SELECT path FROM images WHERE id=? AND status!='removed'", (image_id,)).fetchone()
+                row = db.execute("SELECT * FROM images WHERE id=? AND status!='removed'", (image_id,)).fetchone()
                 if row is None:
                     return False
+                ram_data = self.ram_for_hash(row, row['sha256'])
+                if ram_tags is not None:
+                    if not isinstance(ram_tags, list) or any(not isinstance(tag, str) for tag in ram_tags):
+                        raise ValueError('RAM tags must be an array of strings')
+                    ram_data = {'tags': list(dict.fromkeys(tag.strip().lower()[:300] for tag in ram_tags[:500] if tag.strip())),
+                                'tags_chinese': []}
+                    db.execute("""UPDATE images SET ram_data=?,ram_model=coalesce(ram_model,'manual'),
+                        ram_sha256=sha256,ram_manually_edited=1,ram_error=NULL,ram_retry_at=0 WHERE id=?""",
+                        (json.dumps(ram_data), image_id))
                 db.execute("""UPDATE images SET status='done',analysis=?,search_text=?,a1111_metadata=?,
                     manually_edited=1,palette=coalesce(palette,'[]'),analysis_version=?,error=NULL,retry_at=0,attempts=0,updated=? WHERE id=?""",
-                    (json.dumps(result), self.search_text(Path(row['path']), result, metadata),
+                    (json.dumps(result), self.search_text(Path(row['path']), result, metadata, ram_data),
                      json.dumps(metadata) if metadata else None, ANALYSIS_VERSION, time.time(), image_id))
         self.log.info('Image data manually corrected: %s', row['path'])
         return True
@@ -352,7 +369,7 @@ class Index:
                 # Retain only file identity and an exclusion marker so scans skip it.
                 db.execute("""UPDATE images SET status='removed',analysis=NULL,search_text=NULL,
                     palette=NULL,width=NULL,height=NULL,model=NULL,a1111_metadata=NULL,analysis_version=0,error=NULL,attempts=0,
-                    retry_at=0,image_embedding=NULL,embedding_model=NULL,embedding_sha256=NULL,embedding_error=NULL,embedding_retry_at=0,updated=? WHERE id=?""", (time.time(), image_id))
+                    retry_at=0,image_embedding=NULL,embedding_model=NULL,embedding_sha256=NULL,embedding_error=NULL,embedding_retry_at=0,ram_data=NULL,ram_model=NULL,ram_sha256=NULL,ram_error=NULL,ram_retry_at=0,ram_manually_edited=0,updated=? WHERE id=?""", (time.time(), image_id))
         self.log.info('Removed image from index; excluded from future scans: %s', row['path'])
         return True
 
@@ -557,7 +574,7 @@ class Index:
                 if scan_generation == self.generation:
                     self.state['progress'].update(phase='scanning', total=len(candidates), discovered=len(candidates))
             self.log.info('Discovered %s images to check', len(candidates))
-            if backend == 'hybrid':
+            if backend in ('openclip', 'hybrid'):
                 with self.state_lock:
                     self.state['progress'].update(phase='embedding', scanned=0)
                 self.log.info('OpenCLIP and metadata pass started for %s images', len(candidates))
@@ -578,15 +595,40 @@ class Index:
                 with self.state_lock:
                     self.reset_analysis_timing()
                     self.state['progress'].update(phase='scanning', scanned=0)
-                self.log.info('OpenCLIP pass finished; llama-server pass started')
-            for candidate in candidates:
+                self.log.info('OpenCLIP and metadata pass finished')
+            if self.config.get('recognize_enabled', False):
+                with self.state_lock:
+                    self.reset_analysis_timing()
+                    self.state['progress'].update(phase='recognizing', scanned=0)
+                self.log.info('RAM++ tagging pass started for %s images', len(candidates))
+                for path in candidates:
+                    if interrupted():
+                        return
+                    with self.state_lock:
+                        self.state['current'] = str(path)
+                    try:
+                        self.process_recognition(self.permitted(path), scan_generation)
+                    except RecognitionError:
+                        raise
+                    except Exception:
+                        self.log.exception('Cannot tag %s with RAM++', path)
+                    with self.state_lock:
+                        if scan_generation == self.generation:
+                            self.state['progress']['scanned'] += 1
+                self.log.info('RAM++ tagging pass finished')
+            if backend in ('llama', 'hybrid'):
+                with self.state_lock:
+                    self.reset_analysis_timing()
+                    self.state['progress'].update(phase='scanning', scanned=0)
+                self.log.info('Llama-server pass started')
+            for candidate in candidates if backend in ('llama', 'hybrid') else []:
                 if interrupted():
                     return
                 with self.state_lock:
                     self.state['current'] = str(candidate)
                 try:
                     self.process(self.permitted(candidate), scan_generation)
-                except OpenClipError:
+                except (OpenClipError, RecognitionError):
                     raise
                 except Exception:
                     self.log.exception('Cannot index %s', candidate)
@@ -617,14 +659,19 @@ class Index:
         return digest.hexdigest()
 
     @staticmethod
-    def search_text(path, result, metadata=None):
+    def search_text(path, result, metadata=None, ram_data=None):
         people = []
         for person in result.get('people', []):
             people.extend([person['position'], person['age_group'], person['gender_presentation'],
                            *person['clothing'], *person['accessories']])
         return ' '.join([path.name, result['description'], *result['scenes'],
                          *result['objects'], *result['colours'], *people,
-                         metadata['raw'] if metadata else '']).lower()
+                         metadata['raw'] if metadata else '', *(ram_data or {}).get('tags', []),
+                         *(ram_data or {}).get('tags_chinese', [])]).lower()
+
+    @staticmethod
+    def ram_for_hash(row, digest):
+        return json.loads(row['ram_data']) if row and row['ram_data'] and row['ram_sha256'] == digest else None
 
     def process_embedding(self, path, expected_generation=None):
         if self.excluded_path(path):
@@ -692,7 +739,7 @@ class Index:
                         image_embedding=excluded.image_embedding,embedding_model=excluded.embedding_model,
                         embedding_sha256=excluded.embedding_sha256,embedding_error=NULL,embedding_retry_at=0,manually_edited=excluded.manually_edited""",
                         (str(path), stat.st_size, stat.st_mtime_ns, digest, json.dumps(result),
-                         self.search_text(path, result, metadata), json.dumps(palette), width, height,
+                         self.search_text(path, result, metadata, self.ram_for_hash(previous, digest)), json.dumps(palette), width, height,
                          caption_source['model'] if preserve else None, time.time(), metadata_json,
                          caption_source['analysis_version'] if preserve else 0, vector, key, digest,
                          caption_source['manually_edited'] if preserve else 0))
@@ -717,10 +764,107 @@ class Index:
                         self.analysis_seconds += max(0, time.monotonic() - started)
                         self.active_analysis_started = None
 
+    def process_recognition(self, path, expected_generation=None):
+        if self.excluded_path(path):
+            return
+        with self.control_lock:
+            if self.paused or (expected_generation is not None and expected_generation != self.generation):
+                return
+            generation, config = self.generation, dict(self.config)
+            key, stat = recognition_key(config), path.stat()
+            with self.connect() as db:
+                row = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
+                if row and row['status'] == 'removed':
+                    return
+                unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
+                if unchanged and row['ram_data'] and row['ram_sha256'] == row['sha256'] and (
+                        row['ram_model'] == key or row['ram_manually_edited']):
+                    return
+                if unchanged and row['ram_retry_at'] > time.time():
+                    return
+        digest = row['sha256'] if unchanged and row['sha256'] else self.hash_file(path)
+        metadata = (json.loads(row['a1111_metadata']) if unchanged and row['a1111_metadata']
+                    else read_a1111_metadata(path))
+        with self.connect() as db:
+            cached = db.execute("""SELECT * FROM images WHERE ram_sha256=? AND ram_data IS NOT NULL
+                AND status='done' AND (ram_model=? OR ram_manually_edited=1)
+                ORDER BY ram_manually_edited DESC,id LIMIT 1""", (digest, key)).fetchone()
+        started = None
+        try:
+            if cached:
+                data = json.loads(cached['ram_data'])
+            else:
+                with self.state_lock:
+                    if generation == self.generation:
+                        started = self.active_analysis_started = time.monotonic()
+                self.log.info('RAM++ tagging: %s', path)
+                data = self.recognizer.image(path, config)
+            validate_recognition_data(data)
+            after = path.stat()
+            if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+                raise ValueError('File changed during RAM++ analysis; will retry')
+            if unchanged and row['palette']:
+                palette, width, height = json.loads(row['palette']), row['width'], row['height']
+            else:
+                _, palette, width, height = self.prepare(path)
+            with self.control_lock:
+                if self.paused or generation != self.generation:
+                    return
+                with self.connect() as db:
+                    previous = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
+                    if previous and (previous['status'] == 'removed' or (
+                            previous['ram_manually_edited'] and previous['ram_sha256'] == digest)):
+                        return
+                    preserve = previous and previous['analysis'] and (
+                        previous['sha256'] == digest or (not previous['sha256'] and unchanged))
+                    result = json.loads(previous['analysis']) if preserve else {
+                        'description': '', 'scenes': [], 'objects': [], 'colours': [], 'people': []}
+                    if preserve and previous['manually_edited']:
+                        metadata = json.loads(previous['a1111_metadata']) if previous['a1111_metadata'] else None
+                    db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,status,analysis,search_text,
+                        palette,width,height,model,updated,a1111_metadata,analysis_version,manually_edited,
+                        ram_data,ram_model,ram_sha256,ram_manually_edited)
+                        VALUES(?,?,?,?,'done',?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
+                        sha256=excluded.sha256,status='done',analysis=excluded.analysis,search_text=excluded.search_text,
+                        palette=excluded.palette,width=excluded.width,height=excluded.height,model=excluded.model,
+                        updated=excluded.updated,a1111_metadata=excluded.a1111_metadata,analysis_version=excluded.analysis_version,
+                        manually_edited=excluded.manually_edited,ram_data=excluded.ram_data,ram_model=excluded.ram_model,
+                        ram_sha256=excluded.ram_sha256,ram_manually_edited=excluded.ram_manually_edited,
+                        ram_error=NULL,ram_retry_at=0""",
+                        (str(path), stat.st_size, stat.st_mtime_ns, digest, json.dumps(result),
+                         self.search_text(path, result, metadata, data), json.dumps(palette), width, height,
+                         previous['model'] if preserve else None, time.time(), json.dumps(metadata) if metadata else None,
+                         previous['analysis_version'] if preserve else 0, previous['manually_edited'] if preserve else 0,
+                         json.dumps(data), cached['ram_model'] if cached else key, digest,
+                         cached['ram_manually_edited'] if cached else 0))
+            self.log.info('RAM++ %s: %s', 'hash reused' if cached else 'indexed', path)
+        except Exception as exc:
+            self.log.exception('RAM++ failed for %s', path)
+            with self.control_lock:
+                if generation == self.generation:
+                    with self.connect() as db:
+                        db.execute("""INSERT INTO images(path,size,mtime_ns,status,ram_error,ram_retry_at,updated)
+                            VALUES(?,?,?,'error',?,?,?) ON CONFLICT(path) DO UPDATE SET
+                            ram_error=excluded.ram_error,ram_retry_at=excluded.ram_retry_at,updated=excluded.updated
+                            WHERE images.status!='removed'""",
+                            (str(path), stat.st_size, stat.st_mtime_ns, str(exc)[:1000], time.time()+60, time.time()))
+            if isinstance(exc, RecognitionError):
+                raise
+        finally:
+            if started is not None:
+                with self.state_lock:
+                    if generation == self.generation:
+                        self.analysis_count += 1
+                        self.analysis_seconds += max(0, time.monotonic() - started)
+                        self.active_analysis_started = None
+
     def process(self, path, expected_generation=None):
         backend = self.config.get('analysis_backend', 'llama')
         if backend in ('openclip', 'hybrid'):
             self.process_embedding(path, expected_generation)
+        if self.config.get('recognize_enabled', False):
+            self.process_recognition(path, expected_generation)
         if backend in ('llama', 'hybrid'):
             self._process_llama(path, expected_generation)
 
@@ -783,7 +927,7 @@ class Index:
                         height=excluded.height,model=excluded.model,error=NULL,attempts=0,retry_at=0,
                         updated=excluded.updated,a1111_metadata=excluded.a1111_metadata,analysis_version=excluded.analysis_version,manually_edited=excluded.manually_edited""",
                         (str(path), stat.st_size, stat.st_mtime_ns, digest, cached['analysis'],
-                         self.search_text(path, result, metadata), cached['palette'], cached['width'],
+                         self.search_text(path, result, metadata, self.ram_for_hash(row, digest)), cached['palette'], cached['width'],
                          cached['height'], cached['model'], time.time(), metadata_json, ANALYSIS_VERSION,cached['manually_edited']))
                     self.log.info('Reused analysis by SHA-256: %s (from %s)', path, cached['path'])
                     return
@@ -793,10 +937,10 @@ class Index:
                 db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,a1111_metadata) VALUES(?,?,?,?,?)
                     ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
                     sha256=excluded.sha256,a1111_metadata=excluded.a1111_metadata,manually_edited=0,
-                    status=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN 'done' ELSE 'pending' END,
-                    analysis=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN images.analysis ELSE NULL END,
-                    search_text=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN images.search_text ELSE NULL END,
-                    palette=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN images.palette ELSE NULL END,error=NULL""",
+                    status=CASE WHEN (images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 OR images.ram_data IS NOT NULL AND images.ram_sha256=excluded.sha256) THEN 'done' ELSE 'pending' END,
+                    analysis=CASE WHEN (images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 OR images.ram_data IS NOT NULL AND images.ram_sha256=excluded.sha256) THEN images.analysis ELSE NULL END,
+                    search_text=CASE WHEN (images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 OR images.ram_data IS NOT NULL AND images.ram_sha256=excluded.sha256) THEN images.search_text ELSE NULL END,
+                    palette=CASE WHEN (images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 OR images.ram_data IS NOT NULL AND images.ram_sha256=excluded.sha256) THEN images.palette ELSE NULL END,error=NULL""",
                     (str(path), stat.st_size, stat.st_mtime_ns, digest, metadata_json))
         with self.state_lock:
             self.state['current'] = str(path)
@@ -810,7 +954,7 @@ class Index:
             after = path.stat()
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError('File changed during analysis; will retry')
-            search = self.search_text(path, result, metadata)
+            search = self.search_text(path, result, metadata, self.ram_for_hash(row, digest))
             with self.control_lock:
                 if generation != self.generation:
                     self.log.info('Discarded analysis after index or settings changed: %s', path)
@@ -830,7 +974,7 @@ class Index:
                 if generation != self.generation:
                     return
                 with self.connect() as db:
-                    db.execute("UPDATE images SET status=CASE WHEN image_embedding IS NOT NULL AND embedding_sha256=sha256 AND analysis IS NOT NULL THEN 'done' ELSE 'error' END,error=?,attempts=?,retry_at=?,updated=? WHERE path=? AND status!='removed' AND manually_edited=0",
+                    db.execute("UPDATE images SET status=CASE WHEN (image_embedding IS NOT NULL AND embedding_sha256=sha256 OR ram_data IS NOT NULL AND ram_sha256=sha256) AND analysis IS NOT NULL THEN 'done' ELSE 'error' END,error=?,attempts=?,retry_at=?,updated=? WHERE path=? AND status!='removed' AND manually_edited=0",
                         (str(exc)[:1000], attempts + 1, time.time() + min(3600, 60 * 2 ** min(attempts, 6)), time.time(), str(path)))
 
         finally:
@@ -901,4 +1045,5 @@ class Index:
             a1111_metadata=json.loads(r['a1111_metadata']) if r['a1111_metadata'] else None,
             embedded=bool(r['image_embedding'] and r['embedding_model'] == model_key(config)
                           and r['embedding_sha256'] == r['sha256']),
-            semantic_score=semantic_scores.get(r['id']), manually_edited=bool(r['manually_edited'])) for r in rows]}
+            semantic_score=semantic_scores.get(r['id']), manually_edited=bool(r['manually_edited']),
+            ram_data=self.ram_for_hash(r, r['sha256']), ram_manually_edited=bool(r['ram_manually_edited'])) for r in rows]}

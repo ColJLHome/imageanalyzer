@@ -18,8 +18,18 @@ class RuntimeSettings(BaseModel):
     openclip_model: str = Field(default='ViT-B-32', min_length=1, max_length=250)
     openclip_pretrained: str = Field(default='laion2b_s34b_b79k', min_length=1, max_length=500)
     openclip_device: Literal['auto', 'cpu', 'cuda'] = 'auto'
+    recognize_enabled: bool = False
+    recognize_device: Literal['auto', 'cpu', 'cuda'] = 'auto'
+    recognize_checkpoint: str = Field(default='', max_length=2000)
     scan_sort_by: Literal['created', 'size', 'name'] = 'name'
     scan_sort_direction: Literal['asc', 'desc'] = 'asc'
+
+    @field_validator('recognize_checkpoint')
+    @classmethod
+    def validate_checkpoint(cls, value):
+        if value and (not Path(value).is_absolute() or '\x00' in value):
+            raise ValueError('Use an absolute local checkpoint path, or leave empty for official weights')
+        return value
 
     @field_validator('llama_url')
     @classmethod

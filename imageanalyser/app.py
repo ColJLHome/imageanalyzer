@@ -26,6 +26,7 @@ from .core import Index
 from .settings import RuntimeSettings
 from .embeddings import OpenClipError, model_key
 from .runner import RESTART_EXIT_CODE, supervise
+from .recognition import recognition_key
 
 
 class ImageEditRequest(BaseModel):
@@ -35,6 +36,7 @@ class ImageEditRequest(BaseModel):
     colours: list[str] = Field(max_length=100)
     people: list[dict] = Field(default_factory=list, max_length=10)
     a1111_raw: str = Field(default='', max_length=128000)
+    ram_tags: list[str] | None = Field(default=None, max_length=500)
 
 
 class ClearRequest(BaseModel):
@@ -145,13 +147,15 @@ def create_app(config, restart_callback=None):
             counts = dict(db.execute("SELECT status,count(*) FROM images WHERE status!='removed' GROUP BY status").fetchall())
             embedded = db.execute("""SELECT count(*) FROM images WHERE status='done' AND image_embedding IS NOT NULL
                 AND embedding_model=? AND embedding_sha256=sha256""", (model_key(index.config),)).fetchone()[0]
+            recognized = db.execute("""SELECT count(*) FROM images WHERE status='done' AND ram_data IS NOT NULL
+                AND ram_sha256=sha256 AND (ram_model=? OR ram_manually_edited=1)""", (recognition_key(index.config),)).fetchone()[0]
             cleared = db.execute("SELECT value FROM settings WHERE key='diagnostics_cleared_at'").fetchone()
             since = float(cleared['value']) if cleared else None
             errors = [dict(r) for r in db.execute(
-                "SELECT path,coalesce(embedding_error,error) AS error FROM images WHERE (status='error' OR embedding_error IS NOT NULL OR error IS NOT NULL) AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
+                "SELECT path,coalesce(ram_error,embedding_error,error) AS error FROM images WHERE (status='error' OR ram_error IS NOT NULL OR embedding_error IS NOT NULL OR error IS NOT NULL) AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
                 (since, since))]
         with index.state_lock:
-            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'embedding_count': embedded, 'analysis_backend': index.config.get('analysis_backend', 'llama'), 'errors': errors}
+            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'embedding_count': embedded, 'recognition_count': recognized, 'recognize_enabled': index.config.get('recognize_enabled', False), 'analysis_backend': index.config.get('analysis_backend', 'llama'), 'errors': errors}
 
     @app.post('/api/scanner/details/clear')
     def clear_scanner_details(body: ClearRequest):
@@ -180,7 +184,7 @@ def create_app(config, restart_callback=None):
     @app.put('/api/images/{image_id}')
     def edit_image(image_id: int, body: ImageEditRequest):
         try:
-            saved = index.edit_image(image_id, body.model_dump(exclude={'a1111_raw'}), body.a1111_raw)
+            saved = index.edit_image(image_id, body.model_dump(exclude={'a1111_raw', 'ram_tags'}), body.a1111_raw, body.ram_tags)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         if not saved:

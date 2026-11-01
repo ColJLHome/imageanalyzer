@@ -7,10 +7,10 @@ A Linux service that recursively scans mounted image folders, sends images to a 
 Requires Python 3.11+ and a running, vision-capable llama-server with its matching multimodal projector. The application does not download or launch the model. Configure llama-server with an alias such as `--alias local-vision` that matches `model` below.
 
 ```bash
-uv sync --extra openclip
+uv sync --extra openclip --extra recognize
 cp config.example.json config.json
 # Edit config.json with your mount paths and llama-server URL.
-uv run --extra openclip imageanalyser --config config.json
+uv run --extra openclip --extra recognize imageanalyser --config config.json
 ```
 
 Open http://127.0.0.1:8090. Scanning starts automatically and repeats hourly by default. Search results refresh when you submit the search form. All search terms must match; object, scene, and colour filters combine. Filters use substring matching against the model's tags; search is not semantic and does not guarantee object/colour relationships beyond the generated tags. Palettes are displayed for reference; the colour filter searches named model tags.
@@ -41,9 +41,9 @@ Automatic analysis of unchanged content, including an in-flight caption request,
 
 ## OpenCLIP and search backends
 
-Install OpenCLIP support with `uv sync --extra openclip` and launch with `uv run --extra openclip imageanalyser --config config.json`. The extra installs a CPU PyTorch build so it runs on Linux without GPU setup. CPU inference can run alongside llama-server on the GPU. Advanced users can provide a compatible CUDA/ROCm PyTorch environment and select the GPU device; the supplied CPU build does not provide GPU acceleration. Use the installed `.venv/bin/imageanalyser` command if you manage PyTorch packages separately, so a normal `uv sync` does not replace your chosen build.
+Install OpenCLIP support with `uv sync --extra openclip --extra recognize` and launch with `uv run --extra openclip --extra recognize imageanalyser --config config.json`. The OpenCLIP extra installs a CPU PyTorch build so it runs on Linux without GPU setup. CPU inference can run alongside llama-server on the GPU. Advanced users can provide a compatible CUDA/ROCm PyTorch environment and select the GPU device; the supplied CPU build does not provide GPU acceleration. Use the installed `.venv/bin/imageanalyser` command if you manage PyTorch packages separately, so a normal `uv sync` does not replace your chosen build.
 
-In Settings choose **llama-server**, **OpenCLIP**, or **Both**. Both performs a full pass extracting image embeddings and A1111 metadata across every discovered image before beginning the llama-server pass. The scanner order applies to each pass. OpenCLIP-only never calls llama-server; it preserves existing descriptions and adds searchable image vectors. Embeddings are stored as normalized float32 vectors in SQLite, keyed by image SHA-256 and OpenCLIP model/weights identity. Identical images reuse embeddings, and changing models builds a separate set for the new model. Completed embeddings resume after restarts. Removed images remain excluded. A model-loading failure stops the pass rather than starting llama-server without OpenCLIP coverage; individual unreadable/corrupt files are logged and skipped.
+In Settings choose **llama-server**, **OpenCLIP**, or **Both**. Both performs a full pass extracting image embeddings and A1111 metadata across every discovered image, then the optional RAM++ tagging pass, before beginning the llama-server pass. The scanner order applies to each pass. OpenCLIP-only never calls llama-server; it preserves existing descriptions and adds searchable image vectors. Embeddings are stored as normalized float32 vectors in SQLite, keyed by image SHA-256 and OpenCLIP model/weights identity. Identical images reuse embeddings, and changing models builds a separate set for the new model. Completed embeddings resume after restarts. Removed images remain excluded. A model-loading failure stops the pass rather than starting llama-server without OpenCLIP coverage; individual unreadable/corrupt files are logged and skipped.
 
 The initial default model is `ViT-B-32` with `laion2b_s34b_b79k` weights. First use downloads weights into the Hugging Face cache. To pre-download them use:
 
@@ -54,6 +54,28 @@ hf download laion/CLIP-ViT-B-32-laion2B-s34B-b79K open_clip_pytorch_model.bin op
 Hover over an image's **OpenCLIP** badge (or focus it with the keyboard) to see a scrollable tooltip with the full stored vector, model/weights identity, dimensions, image hash, validation flags, and the current search similarity score when available. Data is loaded on demand rather than included in every search response. The tooltip stays open while you move into it to scroll, and Escape dismisses it.
 
 Search modes are **Visual similarity** (rank image embeddings against the query), **Keywords and metadata** (the existing text match), and **Combined search** (reciprocal-rank fusion of both). Visual scores are cosine similarity, not probabilities or confirmed detections. Semantic ranking returns indexed images by relevance, including low-scoring results; it does not require literal tag matches. Scene/object/colour filters still use stored llama-server tags, so they may exclude images that only have embeddings. Combined search falls back to keywords when the selected backend does not enable OpenCLIP. Existing captions, people details, metadata, backups, and exclusions are retained. OpenCLIP does not generate new person descriptions; those appear during the later llama-server pass.
+
+## Recognize Anything (RAM++)
+
+Enable **Recognize Anything (RAM++) tagging** in Settings to add the [official Recognize Anything repository](https://github.com/xinyu1205/recognize-anything) as an additional tagging tool. With Both selected, each scan completes these full-collection stages in order: OpenCLIP plus A1111 metadata, RAM++ tagging, then llama-server descriptions. OpenCLIP-only mode can also run the RAM++ stage, without calling llama-server. Model-loading/inference failures stop the pass before captioning; individual unreadable images are logged and skipped.
+
+Install and launch with both extras:
+
+```bash
+uv sync --extra openclip --extra recognize
+uv run --extra openclip --extra recognize imageanalyser --config config.json
+```
+
+The integration pins upstream code to commit `7cb804a8609e9f4b1a50b7f31436d2df40bb9481` and uses the official RAM++ Swin-Large checkpoint at revision `84d4aee3a0265c4e0df1f714f0572011d1bf2ec3`. The inference dependencies are tested with modern timm shared by OpenCLIP and Transformers 4.46. The upstream training requirements are not needed. The official checkpoint is about 3 GB; first use also downloads the BERT tokenizer. To pre-download:
+
+```bash
+hf download xinyu1205/recognize-anything-plus-model ram_plus_swin_large_14m.pth --revision 84d4aee3a0265c4e0df1f714f0572011d1bf2ec3
+hf download bert-base-uncased tokenizer_config.json vocab.txt config.json
+```
+
+Settings provides CPU/automatic/GPU device selection and an optional absolute local checkpoint path. Leave the path empty for official weights. The supplied CPU PyTorch build can run alongside llama-server; GPU mode needs a compatible CUDA/ROCm installation.
+
+English and Chinese tags are stored separately in SQLite, shown under **Recognize Anything (RAM++) tags**, and included in keyword/combined search. Tags are model predictions rather than verified facts; no confidence percentages are invented. Existing captions, embeddings, metadata, and manual edits are retained. Tags reuse SHA-256 matches after moves/copies, resume across restarts, and are rebuilt when the checkpoint identity changes. **Edit data** lets you correct the RAM++ tags; corrected tags are protected from automatic updates for unchanged content. Hidden folders and individually removed images remain excluded. Backups include the tag records.
 
 ## A1111 generation metadata
 
@@ -79,7 +101,7 @@ Changing the model field selects the name/alias sent with requests; model instal
 
 In **Settings → Backend**, select **Restart backend**, then confirm. The interface waits for a new backend instance and reconnects automatically. The database, saved settings, exclusions, and persisted scanner pause state are retained. An unfinished analysis is discarded and becomes eligible for retry after startup. Unsaved form edits are not retained. This restarts the image analyser only; it does not restart llama-server or the machine.
 
-Launch through `uv run --extra openclip imageanalyser --config config.json` (or the equivalent installed command). That command runs a supervisor which starts a fresh backend process on a confirmed web restart, reloading code and `config.json`. It also works with the systemd unit below. Direct custom ASGI launches do not enable the restart button. After first installing this feature, stop and start the old application once to activate the supervisor.
+Launch through `uv run --extra openclip --extra recognize imageanalyser --config config.json` (or the equivalent installed command). That command runs a supervisor which starts a fresh backend process on a confirmed web restart, reloading code and `config.json`. It also works with the systemd unit below. Direct custom ASGI launches do not enable the restart button. After first installing this feature, stop and start the old application once to activate the supervisor.
 
 ### Analysis order
 
@@ -142,7 +164,7 @@ The web service binds to loopback by default. Use an SSH tunnel for remote acces
 ## Verification
 
 ```bash
-uv run --extra openclip python -m unittest discover -s tests -v
+uv run --extra openclip --extra recognize python -m unittest discover -s tests -v
 ```
 
 Tests use a fake analysis function and temporary images; they do not require a GPU or llama-server.
