@@ -5,6 +5,18 @@ description = "Search mounted image folders using a local llama-server vision mo
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "httpx>=0.28,<1", "Pillow>=11,<13"]
 
+[project.optional-dependencies]
+openclip = ["open_clip_torch>=3.2,<4", "torch>=2.6,<3", "torchvision>=0.21,<1"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", extra = "openclip" }]
+torchvision = [{ index = "pytorch-cpu", extra = "openclip" }]
+
 [project.scripts]
 imageanalyser = "imageanalyser.app:main"
 

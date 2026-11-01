@@ -7,10 +7,10 @@ A Linux service that recursively scans mounted image folders, sends images to a 
 Requires Python 3.11+ and a running, vision-capable llama-server with its matching multimodal projector. The application does not download or launch the model. Configure llama-server with an alias such as `--alias local-vision` that matches `model` below.
 
 ```bash
-uv sync
+uv sync --extra openclip
 cp config.example.json config.json
 # Edit config.json with your mount paths and llama-server URL.
-uv run imageanalyser --config config.json
+uv run --extra openclip imageanalyser --config config.json
 ```
 
 Open http://127.0.0.1:8090. Scanning starts automatically and repeats hourly by default. Search results refresh when you submit the search form. All search terms must match; object, scene, and colour filters combine. Filters use substring matching against the model's tags; search is not semantic and does not guarantee object/colour relationships beyond the generated tags. Palettes are displayed for reference; the colour filter searches named model tags.
@@ -32,6 +32,26 @@ On the Settings tab, **Clear image index** removes all stored image records and 
 The **Scanner details** tab shows current activity, folder status, and recent errors. **Clear scanner details** dismisses these diagnostics without deleting image records, changing retry schedules, pausing scanning, or removing logs. New activity and errors appear as scanning continues.
 
 The **Logs** tab refreshes every five seconds while open and shows recent scanner events, image analysis durations, unavailable roots, and exception tracebacks. Logs are written to `data_dir/imageanalyser.log`, with three rotating backups of up to 2 MB each. The tab displays up to 300 recent lines from the current file; older entries are available in the backups. Clearing images retains diagnostic logs. These are application logs; llama-server's own GPU and inference logs remain in its console or service journal.
+
+## Correcting image data
+
+Select **Edit data** on an image card to correct its description, scenes, object/clothing tags, colours, individual people details, and saved A1111 metadata. The form provides ordinary fields for each person; no JSON editing is required. Saving updates search immediately, retains OpenCLIP embeddings, and marks the entry **Manually corrected**. These corrections only change the database, not source images or embedded metadata.
+
+Automatic analysis of unchanged content, including an in-flight caption request, cannot overwrite manual corrections. Corrected data is also preserved during embedding rebuilds and hash reuse after moves/copies. Replacing an image's bytes permits fresh analysis for the new content. Clearing the image index removes corrections along with the other records, so include them in database backups.
+
+## OpenCLIP and search backends
+
+Install OpenCLIP support with `uv sync --extra openclip` and launch with `uv run --extra openclip imageanalyser --config config.json`. The extra installs a CPU PyTorch build so it runs on Linux without GPU setup. CPU inference can run alongside llama-server on the GPU. Advanced users can provide a compatible CUDA/ROCm PyTorch environment and select the GPU device; the supplied CPU build does not provide GPU acceleration. Use the installed `.venv/bin/imageanalyser` command if you manage PyTorch packages separately, so a normal `uv sync` does not replace your chosen build.
+
+In Settings choose **llama-server**, **OpenCLIP**, or **Both**. Both performs a full pass extracting image embeddings and A1111 metadata across every discovered image before beginning the llama-server pass. The scanner order applies to each pass. OpenCLIP-only never calls llama-server; it preserves existing descriptions and adds searchable image vectors. Embeddings are stored as normalized float32 vectors in SQLite, keyed by image SHA-256 and OpenCLIP model/weights identity. Identical images reuse embeddings, and changing models builds a separate set for the new model. Completed embeddings resume after restarts. Removed images remain excluded. A model-loading failure stops the pass rather than starting llama-server without OpenCLIP coverage; individual unreadable/corrupt files are logged and skipped.
+
+The initial default model is `ViT-B-32` with `laion2b_s34b_b79k` weights. First use downloads weights into the Hugging Face cache. To pre-download them use:
+
+```bash
+hf download laion/CLIP-ViT-B-32-laion2B-s34B-b79K open_clip_pytorch_model.bin open_clip_config.json
+```
+
+Search modes are **Visual similarity** (rank image embeddings against the query), **Keywords and metadata** (the existing text match), and **Combined search** (reciprocal-rank fusion of both). Visual scores are cosine similarity, not probabilities or confirmed detections. Semantic ranking returns indexed images by relevance, including low-scoring results; it does not require literal tag matches. Scene/object/colour filters still use stored llama-server tags, so they may exclude images that only have embeddings. Combined search falls back to keywords when the selected backend does not enable OpenCLIP. Existing captions, people details, metadata, backups, and exclusions are retained. OpenCLIP does not generate new person descriptions; those appear during the later llama-server pass.
 
 ## A1111 generation metadata
 
@@ -57,7 +77,7 @@ Changing the model field selects the name/alias sent with requests; model instal
 
 In **Settings → Backend**, select **Restart backend**, then confirm. The interface waits for a new backend instance and reconnects automatically. The database, saved settings, exclusions, and persisted scanner pause state are retained. An unfinished analysis is discarded and becomes eligible for retry after startup. Unsaved form edits are not retained. This restarts the image analyser only; it does not restart llama-server or the machine.
 
-Launch through `uv run imageanalyser --config config.json` (or the equivalent installed command). That command runs a supervisor which starts a fresh backend process on a confirmed web restart, reloading code and `config.json`. It also works with the systemd unit below. Direct custom ASGI launches do not enable the restart button. After first installing this feature, stop and start the old application once to activate the supervisor.
+Launch through `uv run --extra openclip imageanalyser --config config.json` (or the equivalent installed command). That command runs a supervisor which starts a fresh backend process on a confirmed web restart, reloading code and `config.json`. It also works with the systemd unit below. Direct custom ASGI launches do not enable the restart button. After first installing this feature, stop and start the old application once to activate the supervisor.
 
 ### Analysis order
 
@@ -120,7 +140,7 @@ The web service binds to loopback by default. Use an SSH tunnel for remote acces
 ## Verification
 
 ```bash
-uv run python -m unittest discover -s tests -v
+uv run --extra openclip python -m unittest discover -s tests -v
 ```
 
 Tests use a fake analysis function and temporary images; they do not require a GPU or llama-server.

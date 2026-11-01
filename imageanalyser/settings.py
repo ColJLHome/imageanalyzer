@@ -14,6 +14,10 @@ class RuntimeSettings(BaseModel):
     request_timeout_seconds: int = Field(default=180, ge=1, le=3600)
     max_output_tokens: int = Field(default=2048, ge=128, le=32768)
     enable_thinking: bool = False
+    analysis_backend: Literal['llama', 'openclip', 'hybrid'] = 'llama'
+    openclip_model: str = Field(default='ViT-B-32', min_length=1, max_length=250)
+    openclip_pretrained: str = Field(default='laion2b_s34b_b79k', min_length=1, max_length=500)
+    openclip_device: Literal['auto', 'cpu', 'cuda'] = 'auto'
     scan_sort_by: Literal['created', 'size', 'name'] = 'name'
     scan_sort_direction: Literal['asc', 'desc'] = 'asc'
 

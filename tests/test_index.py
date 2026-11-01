@@ -465,6 +465,41 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(rows[1]['status'], 'removed')
         self.assertEqual(restarted.search()['total'], 1)
 
+    def test_manual_corrections_update_search_and_survive_rescans(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        image_id = self.index.search()['items'][0]['id']
+        corrected = {**self.result, 'description': 'A corrected turquoise bicycle',
+                     'objects': ['turquoise bicycle'], 'people': [],
+                     'a1111_raw': 'corrected prompt\nNegative prompt: old guess\nSteps: 30, Seed: 99'}
+        response = client.put(f'/api/images/{image_id}', json=corrected)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(client.get('/api/search?q=turquoise').json()['total'], 1)
+        self.assertEqual(client.get('/api/search?q=99').json()['total'], 1)
+        self.assertTrue(client.get('/api/search').json()['items'][0]['manually_edited'])
+        with patch.object(app.state.index, 'analyse') as analyse:
+            app.state.index.scan()
+            analyse.assert_not_called()
+        self.assertEqual(client.put('/api/images/9999', json=corrected).status_code, 404)
+        invalid = {**corrected, 'people': [{'age_group': '22'}]}
+        self.assertEqual(client.put(f'/api/images/{image_id}', json=invalid).status_code, 422)
+        self.assertTrue(self.file.exists())
+
+    def test_manual_edit_during_captioning_is_not_overwritten(self):
+        def edit_during_analysis(path):
+            with self.index.connect() as db:
+                image_id = db.execute('SELECT id FROM images WHERE path=?', (str(path),)).fetchone()['id']
+            self.index.edit_image(image_id, {**self.result, 'description': 'Manual correction'}, '')
+            return self.fake_analysis(path)
+        with patch.object(self.index, 'analyse', side_effect=edit_during_analysis):
+            self.index.scan()
+        item = self.index.search()['items'][0]
+        self.assertEqual(item['analysis']['description'], 'Manual correction')
+        self.assertTrue(item['manually_edited'])
+
     def test_scan_progress_counts_checked_and_remaining_including_skips(self):
         second = self.root / 'second.png'
         Image.new('RGB', (30, 30), 'blue').save(second)

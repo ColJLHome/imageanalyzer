@@ -28,7 +28,11 @@ def read_a1111_metadata(path):
             text = decode_comment(comment or image.info.get('comment'))
             if not re.search(r'(?m)^Steps:\s*\d+', text):
                 return None
-    if not text:
+    return parse_a1111_text(text)
+
+
+def parse_a1111_text(text):
+    if not text.strip():
         return None
     text = text[:128_000]
     match = re.search(r'(?m)^Steps:\s*\d+', text)

@@ -18,7 +18,8 @@ from PIL import Image, ImageOps
 
 from .settings import RuntimeSettings
 from .file_order import creation_time_ns
-from .metadata import read_a1111_metadata
+from .metadata import read_a1111_metadata, parse_a1111_text
+from .embeddings import OpenClipEncoder, OpenClipError, model_key, rank_vectors
 
 ANALYSIS_VERSION = 1
 
@@ -135,6 +136,7 @@ class Index:
         self.log.addHandler(self.log_handler)
         self.control_lock = threading.RLock()
         self.generation = 0
+        self.encoder = OpenClipEncoder()
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.scan_lock = threading.Lock()
@@ -163,10 +165,15 @@ class Index:
     def migrate_images(db):
         columns = {row['name'] for row in db.execute('PRAGMA table_info(images)')}
         for column, definition in [('sha256', 'TEXT'), ('a1111_metadata', 'TEXT'),
-                                   ('analysis_version', 'INTEGER NOT NULL DEFAULT 0')]:
+                                   ('analysis_version', 'INTEGER NOT NULL DEFAULT 0'),
+                                   ('image_embedding', 'BLOB'), ('embedding_model', 'TEXT'),
+                                   ('embedding_sha256', 'TEXT'), ('embedding_error', 'TEXT'),
+                                   ('embedding_retry_at', 'REAL NOT NULL DEFAULT 0'),
+                                   ('manually_edited', 'INTEGER NOT NULL DEFAULT 0')]:
             if column not in columns:
                 db.execute(f'ALTER TABLE images ADD COLUMN {column} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
+        db.execute('CREATE INDEX IF NOT EXISTS images_embedding_hash ON images(embedding_model,embedding_sha256)')
 
     def reset_analysis_timing(self):
         self.analysis_count = 0
@@ -179,7 +186,7 @@ class Index:
             average = self.analysis_seconds / self.analysis_count if self.analysis_count else None
             remaining = max(0, progress['total'] - progress['scanned']) if progress['total'] is not None else None
             estimate = None
-            if progress['phase'] in ('scanning', 'complete') and remaining is not None:
+            if progress['phase'] in ('scanning', 'embedding', 'complete') and remaining is not None:
                 if remaining == 0:
                     estimate = 0.0
                 elif average is not None:
@@ -277,6 +284,7 @@ class Index:
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('runtime_config', ?)",
                            (json.dumps(values),))
                 db.execute("UPDATE images SET retry_at=0,attempts=0 WHERE status='error'")
+                db.execute('UPDATE images SET embedding_retry_at=0,embedding_error=NULL')
             self.config = {**self.config, **values}
             self.roots = [Path(p) for p in values['roots']]
             self.generation += 1
@@ -300,6 +308,21 @@ class Index:
         self.log.info('Cleared %s image records; scanning paused until Resume scanning', count)
         return count
 
+    def edit_image(self, image_id, analysis, metadata_raw):
+        result = parse_analysis(json.dumps(analysis))
+        metadata = parse_a1111_text(metadata_raw)
+        with self.control_lock:
+            with self.connect() as db:
+                row = db.execute("SELECT path FROM images WHERE id=? AND status!='removed'", (image_id,)).fetchone()
+                if row is None:
+                    return False
+                db.execute("""UPDATE images SET status='done',analysis=?,search_text=?,a1111_metadata=?,
+                    manually_edited=1,palette=coalesce(palette,'[]'),analysis_version=?,error=NULL,retry_at=0,attempts=0,updated=? WHERE id=?""",
+                    (json.dumps(result), self.search_text(Path(row['path']), result, metadata),
+                     json.dumps(metadata) if metadata else None, ANALYSIS_VERSION, time.time(), image_id))
+        self.log.info('Image data manually corrected: %s', row['path'])
+        return True
+
     def remove_image(self, image_id):
         with self.control_lock:
             with self.connect() as db:
@@ -310,7 +333,7 @@ class Index:
                 # Retain only file identity and an exclusion marker so scans skip it.
                 db.execute("""UPDATE images SET status='removed',analysis=NULL,search_text=NULL,
                     palette=NULL,width=NULL,height=NULL,model=NULL,a1111_metadata=NULL,analysis_version=0,error=NULL,attempts=0,
-                    retry_at=0,updated=? WHERE id=?""", (time.time(), image_id))
+                    retry_at=0,image_embedding=NULL,embedding_model=NULL,embedding_sha256=NULL,embedding_error=NULL,embedding_retry_at=0,updated=? WHERE id=?""", (time.time(), image_id))
         self.log.info('Removed image from index; excluded from future scans: %s', row['path'])
         return True
 
@@ -456,6 +479,7 @@ class Index:
         with self.control_lock:
             scan_generation = self.generation
             roots = list(self.roots)
+            backend = self.config.get('analysis_backend', 'llama')
             sort_by = self.config.get('scan_sort_by', 'name')
             sort_direction = self.config.get('scan_sort_direction', 'asc')
         with self.state_lock:
@@ -504,6 +528,28 @@ class Index:
                 if scan_generation == self.generation:
                     self.state['progress'].update(phase='scanning', total=len(candidates), discovered=len(candidates))
             self.log.info('Discovered %s images to check', len(candidates))
+            if backend == 'hybrid':
+                with self.state_lock:
+                    self.state['progress'].update(phase='embedding', scanned=0)
+                self.log.info('OpenCLIP and metadata pass started for %s images', len(candidates))
+                for path in candidates:
+                    if interrupted():
+                        return
+                    with self.state_lock:
+                        self.state['current'] = str(path)
+                    try:
+                        self.process_embedding(self.permitted(path), scan_generation)
+                    except OpenClipError:
+                        raise
+                    except Exception:
+                        self.log.exception('Cannot embed %s', path)
+                    with self.state_lock:
+                        if scan_generation == self.generation:
+                            self.state['progress']['scanned'] += 1
+                with self.state_lock:
+                    self.reset_analysis_timing()
+                    self.state['progress'].update(phase='scanning', scanned=0)
+                self.log.info('OpenCLIP pass finished; llama-server pass started')
             for candidate in candidates:
                 if interrupted():
                     return
@@ -511,6 +557,8 @@ class Index:
                     self.state['current'] = str(candidate)
                 try:
                     self.process(self.permitted(candidate), scan_generation)
+                except OpenClipError:
+                    raise
                 except Exception:
                     self.log.exception('Cannot index %s', candidate)
                 finally:
@@ -526,6 +574,8 @@ class Index:
                 self.state.update(running=False, current=None, last_scan=time.time())
                 if scan_generation == self.generation:
                     self.state['progress']['phase'] = 'paused' if self.paused else 'interrupted' if interrupted() else 'complete'
+                    if self.state['progress']['total'] is not None and self.state['progress']['scanned'] < self.state['progress']['total'] and not interrupted():
+                        self.state['progress']['phase'] = 'error'
             self.scan_lock.release()
             self.log.info('Scan finished%s', ' (paused)' if self.paused else '')
 
@@ -547,7 +597,103 @@ class Index:
                          *result['objects'], *result['colours'], *people,
                          metadata['raw'] if metadata else '']).lower()
 
+    def process_embedding(self, path, expected_generation=None):
+        with self.control_lock:
+            if self.paused or (expected_generation is not None and expected_generation != self.generation):
+                return
+            generation = self.generation
+            config = dict(self.config)
+            key = model_key(config)
+            stat = path.stat()
+            with self.connect() as db:
+                row = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
+                if row and row['status'] == 'removed':
+                    return
+                unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
+                if unchanged and row['image_embedding'] and row['embedding_model'] == key and row['embedding_sha256'] == row['sha256']:
+                    return
+                if unchanged and row['embedding_retry_at'] > time.time():
+                    return
+        digest = self.hash_file(path)
+        metadata = read_a1111_metadata(path)
+        metadata_json = json.dumps(metadata) if metadata else None
+        with self.connect() as db:
+            cached = db.execute("""SELECT * FROM images WHERE embedding_sha256=?
+                AND embedding_model=? AND image_embedding IS NOT NULL AND status='done' ORDER BY analysis_version DESC,id LIMIT 1""", (digest, key)).fetchone()
+        started = None
+        try:
+            if cached:
+                vector = cached['image_embedding']
+            else:
+                with self.state_lock:
+                    self.state['current'] = str(path)
+                    if generation == self.generation:
+                        started = self.active_analysis_started = time.monotonic()
+                self.log.info('OpenCLIP embedding: %s', path)
+                vector = self.encoder.image(path, config)
+            _, palette, width, height = self.prepare(path)
+            after = path.stat()
+            if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+                raise ValueError('File changed during OpenCLIP analysis; will retry')
+            with self.control_lock:
+                if self.paused or generation != self.generation:
+                    return
+                with self.connect() as db:
+                    previous = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
+                    if previous and previous['status'] == 'removed':
+                        return
+                    caption_source = previous if previous and previous['analysis'] and (
+                        previous['sha256'] == digest or (not previous['sha256'] and unchanged)) else cached
+                    preserve = caption_source is not None and caption_source['analysis'] is not None
+                    if preserve and caption_source['manually_edited']:
+                        metadata = json.loads(caption_source['a1111_metadata']) if caption_source['a1111_metadata'] else None
+                        metadata_json = json.dumps(metadata) if metadata else None
+                    result = json.loads(caption_source['analysis']) if preserve else {
+                        'description': '', 'scenes': [], 'objects': [], 'colours': [], 'people': []}
+                    db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,status,analysis,search_text,
+                        palette,width,height,model,updated,a1111_metadata,analysis_version,
+                        image_embedding,embedding_model,embedding_sha256,manually_edited)
+                        VALUES(?,?,?,?,'done',?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
+                        sha256=excluded.sha256,status='done',analysis=excluded.analysis,search_text=excluded.search_text,
+                        palette=excluded.palette,width=excluded.width,height=excluded.height,model=excluded.model,
+                        updated=excluded.updated,a1111_metadata=excluded.a1111_metadata,analysis_version=excluded.analysis_version,manually_edited=excluded.manually_edited,
+                        image_embedding=excluded.image_embedding,embedding_model=excluded.embedding_model,
+                        embedding_sha256=excluded.embedding_sha256,embedding_error=NULL,embedding_retry_at=0,manually_edited=excluded.manually_edited""",
+                        (str(path), stat.st_size, stat.st_mtime_ns, digest, json.dumps(result),
+                         self.search_text(path, result, metadata), json.dumps(palette), width, height,
+                         caption_source['model'] if preserve else None, time.time(), metadata_json,
+                         caption_source['analysis_version'] if preserve else 0, vector, key, digest,
+                         caption_source['manually_edited'] if preserve else 0))
+            self.log.info('OpenCLIP %s: %s', 'hash reused' if cached else 'indexed', path)
+        except Exception as exc:
+            self.log.exception('OpenCLIP failed for %s', path)
+            with self.control_lock:
+                if generation == self.generation:
+                    with self.connect() as db:
+                        db.execute("""INSERT INTO images(path,size,mtime_ns,status,embedding_error,embedding_retry_at,updated)
+                            VALUES(?,?,?,'error',?,?,?) ON CONFLICT(path) DO UPDATE SET
+                            embedding_error=excluded.embedding_error,embedding_retry_at=excluded.embedding_retry_at,updated=excluded.updated
+                            WHERE images.status!='removed'""",
+                            (str(path), stat.st_size, stat.st_mtime_ns, str(exc)[:1000], time.time()+60, time.time()))
+            if isinstance(exc, OpenClipError):
+                raise
+        finally:
+            if started is not None:
+                with self.state_lock:
+                    if generation == self.generation:
+                        self.analysis_count += 1
+                        self.analysis_seconds += max(0, time.monotonic() - started)
+                        self.active_analysis_started = None
+
     def process(self, path, expected_generation=None):
+        backend = self.config.get('analysis_backend', 'llama')
+        if backend in ('openclip', 'hybrid'):
+            self.process_embedding(path, expected_generation)
+        if backend in ('llama', 'hybrid'):
+            self._process_llama(path, expected_generation)
+
+    def _process_llama(self, path, expected_generation=None):
         with self.control_lock:
             if self.paused or (expected_generation is not None and expected_generation != self.generation):
                 return
@@ -559,6 +705,8 @@ class Index:
                 if row and row['status'] == 'removed':
                     return
                 unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
+                if unchanged and row['manually_edited']:
+                    return
                 if unchanged and row['sha256'] and ((row['status'] == 'done' and row['analysis_version'] >= ANALYSIS_VERSION) or row['retry_at'] > time.time()):
                     return
         # Stream files without holding the control lock while reading network storage.
@@ -580,6 +728,9 @@ class Index:
                 if row and row['status'] == 'removed':
                     return
                 unchanged = row and (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
+                if row and row['manually_edited'] and row['sha256'] == digest:
+                    db.execute('UPDATE images SET size=?,mtime_ns=? WHERE id=?', (stat.st_size,stat.st_mtime_ns,row['id']))
+                    return
                 if unchanged and row['status'] == 'done' and row['analysis_version'] >= ANALYSIS_VERSION:
                     # Upgrade old records without calling the model again.
                     db.execute('UPDATE images SET sha256=? WHERE id=?', (digest, row['id']))
@@ -587,17 +738,20 @@ class Index:
                 cached = db.execute("SELECT * FROM images WHERE sha256=? AND status='done' AND analysis_version>=? ORDER BY id LIMIT 1",
                                     (digest, ANALYSIS_VERSION)).fetchone()
                 if cached:
+                    if cached['manually_edited']:
+                        metadata = json.loads(cached['a1111_metadata']) if cached['a1111_metadata'] else None
+                        metadata_json = json.dumps(metadata) if metadata else None
                     result = json.loads(cached['analysis'])
                     db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,status,analysis,search_text,
-                        palette,width,height,model,updated,a1111_metadata,analysis_version) VALUES(?,?,?,?,'done',?,?,?,?,?,?,?,?,?)
+                        palette,width,height,model,updated,a1111_metadata,analysis_version,manually_edited) VALUES(?,?,?,?,'done',?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
                         sha256=excluded.sha256,status='done',analysis=excluded.analysis,
                         search_text=excluded.search_text,palette=excluded.palette,width=excluded.width,
                         height=excluded.height,model=excluded.model,error=NULL,attempts=0,retry_at=0,
-                        updated=excluded.updated,a1111_metadata=excluded.a1111_metadata,analysis_version=excluded.analysis_version""",
+                        updated=excluded.updated,a1111_metadata=excluded.a1111_metadata,analysis_version=excluded.analysis_version,manually_edited=excluded.manually_edited""",
                         (str(path), stat.st_size, stat.st_mtime_ns, digest, cached['analysis'],
                          self.search_text(path, result, metadata), cached['palette'], cached['width'],
-                         cached['height'], cached['model'], time.time(), metadata_json, ANALYSIS_VERSION))
+                         cached['height'], cached['model'], time.time(), metadata_json, ANALYSIS_VERSION,cached['manually_edited']))
                     self.log.info('Reused analysis by SHA-256: %s (from %s)', path, cached['path'])
                     return
                 if unchanged and row['retry_at'] > time.time():
@@ -605,7 +759,11 @@ class Index:
                 attempts = row['attempts'] if unchanged else 0
                 db.execute("""INSERT INTO images(path,size,mtime_ns,sha256,a1111_metadata) VALUES(?,?,?,?,?)
                     ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
-                    sha256=excluded.sha256,a1111_metadata=excluded.a1111_metadata,status='pending',analysis=NULL,search_text=NULL,palette=NULL,error=NULL""",
+                    sha256=excluded.sha256,a1111_metadata=excluded.a1111_metadata,manually_edited=0,
+                    status=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN 'done' ELSE 'pending' END,
+                    analysis=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN images.analysis ELSE NULL END,
+                    search_text=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN images.search_text ELSE NULL END,
+                    palette=CASE WHEN images.image_embedding IS NOT NULL AND images.embedding_sha256=excluded.sha256 THEN images.palette ELSE NULL END,error=NULL""",
                     (str(path), stat.st_size, stat.st_mtime_ns, digest, metadata_json))
         with self.state_lock:
             self.state['current'] = str(path)
@@ -626,7 +784,7 @@ class Index:
                     return
                 with self.connect() as db:
                     updated = db.execute('''UPDATE images SET status='done',analysis=?,search_text=?,palette=?,
-                        width=?,height=?,model=?,error=NULL,attempts=0,retry_at=0,updated=?,a1111_metadata=?,analysis_version=? WHERE path=? AND status!='removed' ''',
+                        width=?,height=?,model=?,error=NULL,attempts=0,retry_at=0,updated=?,a1111_metadata=?,analysis_version=? WHERE path=? AND status!='removed' AND manually_edited=0 ''',
                         (json.dumps(result), search, json.dumps(palette), width, height,
                          model, time.time(), metadata_json, ANALYSIS_VERSION, str(path)))
                     if not updated.rowcount:
@@ -639,7 +797,7 @@ class Index:
                 if generation != self.generation:
                     return
                 with self.connect() as db:
-                    db.execute("UPDATE images SET status='error',error=?,attempts=?,retry_at=?,updated=? WHERE path=? AND status!='removed'",
+                    db.execute("UPDATE images SET status=CASE WHEN image_embedding IS NOT NULL AND embedding_sha256=sha256 AND analysis IS NOT NULL THEN 'done' ELSE 'error' END,error=?,attempts=?,retry_at=?,updated=? WHERE path=? AND status!='removed' AND manually_edited=0",
                         (str(exc)[:1000], attempts + 1, time.time() + min(3600, 60 * 2 ** min(attempts, 6)), time.time(), str(path)))
 
         finally:
@@ -658,20 +816,56 @@ class Index:
                 self.log.exception('Scanner failed; will retry on next scan')
             self.wake.wait(self.config.get('scan_interval_seconds', 3600))
 
-    def search(self, q='', scene='', object_name='', colour='', offset=0, limit=60):
+    def search(self, q='', scene='', object_name='', colour='', offset=0, limit=60, mode='keyword'):
+        if mode not in ('keyword', 'semantic', 'hybrid'):
+            raise ValueError('Unknown search mode')
+        with self.control_lock:
+            config = dict(self.config)
+        enabled = config.get('analysis_backend', 'llama') in ('openclip', 'hybrid')
+        if mode == 'semantic' and not enabled:
+            raise OpenClipError('Select OpenCLIP or Both in Settings to enable semantic search')
+        if not enabled or not q.strip():
+            mode = 'keyword'
         clauses, params = ["status='done'"], []
-        for term in q.lower().split():
-            clauses.append("instr(search_text, ?) > 0")
-            params.append(term)
         for field, value in [('scenes', scene), ('objects', object_name), ('colours', colour)]:
             if value.strip():
                 clauses.append(f"EXISTS (SELECT 1 FROM json_each(images.analysis, '$.{field}') WHERE instr(lower(value), ?) > 0)")
                 params.append(value.strip().lower())
+        terms = q.lower().split()
+        if mode == 'keyword':
+            for term in terms:
+                clauses.append('instr(search_text, ?) > 0')
+                params.append(term)
         where = ' AND '.join(clauses)
+        semantic_scores = {}
         with self.connect() as db:
-            total = db.execute('SELECT count(*) FROM images WHERE ' + where, params).fetchone()[0]
-            rows = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?',
-                              [*params, limit, offset]).fetchall()
-        return {'total': total, 'items': [dict(id=r['id'], path=r['path'], width=r['width'], height=r['height'],
-                   analysis=json.loads(r['analysis']), palette=json.loads(r['palette']),
-                   a1111_metadata=json.loads(r['a1111_metadata']) if r['a1111_metadata'] else None) for r in rows]}
+            if mode == 'keyword':
+                total = db.execute('SELECT count(*) FROM images WHERE ' + where, params).fetchone()[0]
+                rows = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?',
+                                  [*params, limit, offset]).fetchall()
+            else:
+                candidates = db.execute('SELECT * FROM images WHERE ' + where + ' ORDER BY id DESC', params).fetchall()
+                vectors = [r for r in candidates if r['image_embedding'] and r['embedding_model'] == model_key(config)
+                           and r['embedding_sha256'] == r['sha256']]
+                ranked = rank_vectors(vectors, self.encoder.text(q, config)) if vectors else []
+                semantic_scores = dict(ranked)
+                lexical = [r['id'] for r in candidates if all(term in (r['search_text'] or '') for term in terms)]
+                if mode == 'semantic':
+                    ids = [image_id for image_id, _ in ranked]
+                else:
+                    # Reciprocal rank fusion keeps exact metadata matches useful alongside visual similarity.
+                    fused = {}
+                    for ranking in (lexical, [image_id for image_id, _ in ranked]):
+                        for rank, image_id in enumerate(ranking, 1):
+                            fused[image_id] = fused.get(image_id, 0) + 1 / (60 + rank)
+                    ids = sorted(fused, key=lambda image_id: (-fused[image_id], image_id))
+                total = len(ids)
+                by_id = {r['id']: r for r in candidates}
+                rows = [by_id[image_id] for image_id in ids[offset:offset+limit]]
+        return {'total': total, 'search_mode': mode, 'items': [dict(
+            id=r['id'], path=r['path'], width=r['width'], height=r['height'],
+            analysis=json.loads(r['analysis']), palette=json.loads(r['palette']),
+            a1111_metadata=json.loads(r['a1111_metadata']) if r['a1111_metadata'] else None,
+            embedded=bool(r['image_embedding'] and r['embedding_model'] == model_key(config)
+                          and r['embedding_sha256'] == r['sha256']),
+            semantic_score=semantic_scores.get(r['id']), manually_edited=bool(r['manually_edited'])) for r in rows]}
