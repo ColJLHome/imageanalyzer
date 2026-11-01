@@ -39,6 +39,12 @@ Each image card starts with badges for completed **OpenCLIP**, **A1111**, **RAM+
 
 **A1111 (none)** means metadata was checked but none is currently saved. A missing badge means no result is stored for that stage. Manually entered descriptions do not count as completed llama-server analysis; corrected outputs and stored results from older model settings are labelled in the tooltip.
 
+## Natural-language search
+
+Choose **Natural language** (the default) and describe an image in an ordinary sentence, for example “a person wearing a blue jacket on a beach” or “a quiet forest with a river”. OpenCLIP compares the text to image embeddings, so the words do not have to occur in generated captions or tags. **Natural language + metadata** also includes keyword matches from captions, RAM++ tags, and A1111 metadata. The optional object/scene/colour filters narrow results using saved tags and can be left empty for a broad visual search.
+
+Submitting a natural-language query automatically selects relevance with best matches first. You can then choose a different result order manually. Reset clears the query and tag filters and restores your prior browsing order when relevance was selected automatically; a manually chosen sort order is retained. With no query, browsing still defaults to most recently tagged/indexed first. Natural-language mode requires OpenCLIP embeddings; the scan can continue adding embeddings while you search.
+
 ## Sorting the main page
 
 The Images tab defaults to **Last tagged or indexed → Newest first**. Use **Sort by** to select **Date created**, **Image name**, or **Search relevance**, and use the Order selector or **Reverse order** button to invert the result order. Sorting applies to the whole filtered result set before pagination. Choose Search relevance when you want visual/combined search ranked primarily by similarity rather than date or name.

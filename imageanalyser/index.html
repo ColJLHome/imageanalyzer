@@ -12,6 +12,7 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 .scan-badge{display:inline-block;background:#303f52;padding:3px 7px;margin:3px;border-radius:5px;font-size:12px;border:1px solid #6583a6;cursor:help}.scan-badge:focus-visible{outline:2px solid #9dc9ff}#scan-tooltip{position:fixed;z-index:1000;width:min(620px,calc(100vw - 32px));max-height:60vh;overflow:auto;box-sizing:border-box;padding:16px;background:#101c2b;color:#e9edf5;border:1px solid #6583a6;border-radius:10px;box-shadow:0 8px 30px #0009}#scan-tooltip pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 monospace;margin-bottom:0}
 .scan-badges{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px}.scan-badge{margin:0}.scan-badge.openclip{border-color:#79b1f4}.scan-badge.a1111{border-color:#dcbd70}.scan-badge.ram{border-color:#80d3a3}.scan-badge.llama{border-color:#c09be9}
 .image-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.image-actions button{font-size:12px;padding:7px 9px;min-width:0;white-space:nowrap}
+.search-filters{flex-basis:100%;margin:0}.search-filters .controls{margin:10px 0}
 </style>
 <h1>Image Analyser</h1><p>Search your collection by objects, scenes, and colours.</p>
 <div id="status" role="status">Loading index status…</div>
@@ -22,7 +23,13 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 <section id="images-panel" role="tabpanel" aria-labelledby="images-tab">
 <div class="controls"><button id="scan-now" type="button">Scan for new images</button><button id="resume-scan" type="button">Resume scanning</button></div>
 <div id="action-message" role="status"></div>
-<form id="search"><select name="mode" aria-label="Search mode"><option value="hybrid">Combined search</option><option value="semantic">Visual similarity</option><option value="keyword">Keywords and metadata</option></select><input name="q" placeholder="Search descriptions, clothing and tags" aria-label="Search descriptions and tags"><input name="object" placeholder="Object: red car" aria-label="Object"><input name="scene" placeholder="Scene: beach" aria-label="Scene"><input name="colour" placeholder="Colour: blue" aria-label="Colour"><button>Search</button><button id="reset-search" type="button">Reset</button></form>
+<form id="search">
+<select id="search-mode" name="mode" aria-label="Search mode"><option value="semantic">Natural language</option><option value="hybrid">Natural language + metadata</option><option value="keyword">Keywords and metadata</option></select>
+<input name="q" placeholder="A person wearing a blue jacket on a beach" aria-label="Describe the images you want to find">
+<button>Search</button><button id="reset-search" type="button">Reset</button>
+<details class="search-filters"><summary>Optional tag filters</summary><p>These use saved tags. Leave them empty to search all images by their visual content.</p><div class="controls"><input name="object" placeholder="Object: red car" aria-label="Object"><input name="scene" placeholder="Scene: beach" aria-label="Scene"><input name="colour" placeholder="Colour: blue" aria-label="Colour"></div></details>
+</form>
+<p>Describe what you want in a sentence, such as “a quiet forest with a river” or “a red car parked outside a house”. Natural-language searches show the best visual matches first.</p>
 <div class="controls" aria-label="Result sorting">
 <label>Sort by <select id="result-sort" name="sort_by" form="search"><option value="updated">Last tagged or indexed</option><option value="created">Date created</option><option value="name">Image name</option><option value="relevance">Search relevance</option></select></label>
 <label>Order <select id="result-direction" name="direction" form="search"><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label>
@@ -237,16 +244,30 @@ function formatDuration(seconds){
     return Math.floor(hours/24)+'d '+(hours%24)+'h';
 }
 async function status(){try{const response=await fetch('/api/status');if(!response.ok)throw Error();const s=await response.json();$('openclip-help').hidden=s.analysis_backend==='llama';$('openclip-help').textContent='OpenCLIP: '+(s.embedding_count||0)+' images ready for visual search. Embeddings provide similarity ranking; written descriptions come from the later llama-server pass. For visual search, enter a query and leave scene/object/colour filters empty to include images without saved tags.';if(!restartPending){$('restart-backend').disabled=!s.restart_supported;$('restart-backend').title=s.restart_supported?'':'Launch with the imageanalyser command to enable restart'}$('status').textContent=(s.paused?'Scanning paused':s.running?'Scanning':'Waiting for next scan')+' · '+(s.counts.done||0)+' indexed · '+(s.embedding_count||0)+' embedded'+(s.recognize_enabled?' · '+(s.recognition_count||0)+' RAM++ tagged':'')+' · '+(s.counts.error||0)+' errors';const progress=s.progress||{};const bar=$('scan-progress');bar.hidden=progress.phase==='idle'||!progress.phase;if(progress.total===null){bar.removeAttribute('value');$('scan-progress-label').textContent=progress.phase==='discovering'?'Discovering images: '+(progress.discovered||0)+' found…':progress.phase==='paused'?'Scan paused.':'No scan progress yet.'}else{bar.max=progress.total||1;bar.value=progress.scanned||0;$('scan-progress-label').textContent=(progress.phase==='embedding'?'OpenCLIP pass: ':progress.phase==='recognizing'?'RAM++ tagging pass: ':'')+(progress.scanned||0)+' of '+progress.total+' images checked · '+Math.max(0,progress.total-(progress.scanned||0))+' remaining'+(['scanning','embedding','recognizing'].includes(progress.phase)?' · estimated time remaining: '+(progress.estimated_remaining_seconds==null?'calculating…':'~'+formatDuration(progress.estimated_remaining_seconds)):'')+(progress.phase==='paused'?' (paused)':progress.phase==='complete'?' (complete)':progress.phase==='error'?' (stopped; check Logs)':'')} $('resume-scan').hidden=!s.paused;$('scan-now').disabled=s.running&&!s.paused;const count=s.counts.done||0;const embeddingCount=s.embedding_count||0,recognitionCount=s.recognition_count||0;if((lastIndexedCount!==null&&lastIndexedCount!==count)||(lastEmbeddingCount!==null&&lastEmbeddingCount!==embeddingCount)||(lastRecognitionCount!==null&&lastRecognitionCount!==recognitionCount)||(lastIndexChange!==null&&lastIndexChange!==s.latest_indexed_at)){if($('scan-tooltip').hidden)search();else scanRefreshPending=true;}lastIndexedCount=count;lastEmbeddingCount=embeddingCount;lastRecognitionCount=recognitionCount;lastIndexChange=s.latest_indexed_at;$('details').textContent=JSON.stringify({current:s.current,roots:s.roots,last_scan:s.last_scan?new Date(s.last_scan*1000).toLocaleString():null,recent_errors:s.errors},null,2)}catch{$('status').textContent='Unable to reach server'}}
+let automaticRelevance=false,browseSort=null;
+function restoreBrowseSort(){
+    if(automaticRelevance&&browseSort){$('result-sort').value=browseSort.sort;$('result-direction').value=browseSort.direction;updateSortLabels()}
+    automaticRelevance=false;browseSort=null;
+}
+function submitSearch(){
+    const natural=$('search').elements.namedItem('q').value.trim()&&$('search-mode').value!=='keyword';
+    if(natural){
+        if(!automaticRelevance)browseSort={sort:$('result-sort').value,direction:$('result-direction').value};
+        automaticRelevance=true;$('result-sort').value='relevance';$('result-direction').value='desc';updateSortLabels();
+    }else restoreBrowseSort();
+    offset=0;search();
+}
 function updateSortLabels(){
     const sort=$('result-sort').value,options=$('result-direction').options;
     options[0].textContent=sort==='name'?'Z–A':sort==='relevance'?'Best matches first':'Newest first';
     options[1].textContent=sort==='name'?'A–Z':sort==='relevance'?'Lowest matches first':'Oldest first';
 }
-$('result-sort').onchange=()=>{updateSortLabels();offset=0;search()};
-$('result-direction').onchange=()=>{offset=0;search()};
-$('reverse-results').onclick=()=>{$('result-direction').value=$('result-direction').value==='desc'?'asc':'desc';offset=0;search()};
-$('reset-search').onclick=()=>{for(const input of $('search').querySelectorAll('input'))input.value='';offset=0;search();$('search').elements.namedItem('q').focus()};
-$('search').onsubmit=e=>{e.preventDefault();offset=0;search()};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);search()};$('next').onclick=()=>{offset+=limit;search()};search();status();setInterval(status,5000);
+$('result-sort').onchange=()=>{automaticRelevance=false;browseSort=null;updateSortLabels();offset=0;search()};
+$('result-direction').onchange=()=>{automaticRelevance=false;browseSort=null;offset=0;search()};
+$('reverse-results').onclick=()=>{automaticRelevance=false;browseSort=null;$('result-direction').value=$('result-direction').value==='desc'?'asc':'desc';offset=0;search()};
+$('reset-search').onclick=()=>{for(const input of $('search').querySelectorAll('input'))input.value='';restoreBrowseSort();offset=0;search();$('search').elements.namedItem('q').focus()};
+$('search-mode').onchange=submitSearch;
+$('search').onsubmit=e=>{e.preventDefault();submitSearch()};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);search()};$('next').onclick=()=>{offset+=limit;search()};search();status();setInterval(status,5000);
 function showTab(name){for(const tab of ['images','scanner','logs','settings']){const selected=tab===name;$(tab+'-tab').setAttribute('aria-selected',String(selected));$(tab+'-tab').tabIndex=selected?0:-1;$(tab+'-panel').hidden=!selected}if(name==='logs')loadLogs();if(name==='scanner')status();if(name==='settings'&&!settingsLoaded)loadSettings()}
 for(const tab of ['images','scanner','logs','settings']){$(tab+'-tab').onclick=()=>showTab(tab);$(tab+'-tab').onkeydown=e=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key)){e.preventDefault();const tabs=['images','scanner','logs','settings'];const target=e.key==='Home'?tabs[0]:e.key==='End'?tabs[tabs.length-1]:tabs[(tabs.indexOf(tab)+(e.key==='ArrowRight'?1:tabs.length-1))%tabs.length];showTab(target);$(target+'-tab').focus()}}}
 async function settingsRequest(options){
