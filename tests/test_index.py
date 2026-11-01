@@ -500,6 +500,60 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(item['analysis']['description'], 'Manual correction')
         self.assertTrue(item['manually_edited'])
 
+    def test_hidden_folders_are_skipped_but_hidden_filenames_are_allowed(self):
+        hidden = [self.root / '.imageviewer-thumbnails' / 'nested' / 'thumb.png',
+                  self.root / 'visible' / '.cache' / 'photo.png']
+        allowed = [self.root / 'visible' / '.portrait.png',
+                   self.root / 'imageviewer-thumbnails' / 'photo.png']
+        for path in hidden + allowed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new('RGB', (20, 20), 'blue').save(path)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        paths = {item['path'] for item in self.index.search()['items']}
+        self.assertEqual(paths, {str(self.file), *(str(path) for path in allowed)})
+        self.assertEqual(self.index.state['progress']['total'], 3)
+        for path in hidden:
+            self.assertTrue(path.exists())
+            with self.assertRaises(ValueError):
+                self.index.permitted(path)
+            with patch.object(self.index, 'analyse') as analyse, patch.object(self.index.encoder, 'image') as embed:
+                self.index._process_llama(path)
+                self.index.process_embedding(path)
+                analyse.assert_not_called()
+                embed.assert_not_called()
+        separate = Index({**self.config, 'roots': [str(self.root / '.imageviewer-thumbnails')],
+                          'data_dir': str(self.base / 'separate-data')})
+        self.addCleanup(separate.log_handler.close)
+        separate.scan()
+        self.assertEqual(separate.search()['total'], 0)
+
+    def test_hidden_folder_records_purged_on_startup_and_restore(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        hidden_paths = [self.root / f'.hidden-{i}' / 'nested' / 'photo.png' for i in range(4)]
+        keep = self.root / '.portrait.png'
+        for path in [*hidden_paths, keep]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new('RGB', (20, 20)).save(path)
+        with self.index.connect() as db:
+            for path, status in zip([*hidden_paths, keep], ['done', 'error', 'pending', 'removed', 'done']):
+                db.execute("""INSERT INTO images(path,status,analysis,search_text,palette,sha256,analysis_version)
+                    SELECT ?,?,analysis,search_text,palette,sha256,analysis_version FROM images WHERE path=?""",
+                    (str(path), status, str(self.file)))
+        backup = self.index.backup_database()
+        self.addCleanup(backup.unlink, missing_ok=True)
+        restarted = Index(self.config)
+        self.addCleanup(restarted.log_handler.close)
+        self.assertEqual(restarted.search()['total'], 2)
+        with restarted.connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM images').fetchone()[0], 2)
+        restarted.restore_database(backup)
+        with restarted.connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM images').fetchone()[0], 2)
+        self.assertTrue(all(path.exists() for path in hidden_paths))
+        self.assertIn('records from hidden folders', '\n'.join(restarted.logs()))
+
     def test_scan_progress_counts_checked_and_remaining_including_skips(self):
         second = self.root / 'second.png'
         Image.new('RGB', (30, 30), 'blue').save(second)

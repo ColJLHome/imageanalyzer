@@ -162,6 +162,9 @@ class Index:
                 model TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0, updated REAL)''')
             self.migrate_images(db)
+            removed = self.purge_excluded_images(db)
+        if removed:
+            self.log.info('Removed %s records from hidden folders from index', removed)
 
     @staticmethod
     def migrate_images(db):
@@ -176,6 +179,19 @@ class Index:
                 db.execute(f'ALTER TABLE images ADD COLUMN {column} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS images_sha256 ON images(sha256)')
         db.execute('CREATE INDEX IF NOT EXISTS images_embedding_hash ON images(embedding_model,embedding_sha256)')
+
+    @staticmethod
+    def excluded_directory(path):
+        return any(part.startswith('.') and part not in ('.', '..') for part in Path(path).parts)
+
+    @staticmethod
+    def excluded_path(path):
+        return Index.excluded_directory(Path(path).parent)
+
+    @staticmethod
+    def purge_excluded_images(db):
+        # The final slash ensures a dot-prefixed filename alone is not a folder exclusion.
+        return db.execute("DELETE FROM images WHERE path GLOB '*/.*/*'").rowcount
 
     def reset_analysis_timing(self):
         self.analysis_count = 0
@@ -261,6 +277,7 @@ class Index:
                     source.backup(target)
                     target.execute("INSERT OR REPLACE INTO settings VALUES ('paused', 'true')")
                     self.migrate_images(target)
+                    self.purge_excluded_images(target)
                 self.config = {**restored_config, **restored_settings.model_dump()}
                 self.roots = [Path(p) for p in restored_settings.roots]
             with self.state_lock:
@@ -388,6 +405,8 @@ class Index:
 
     def permitted(self, path):
         path = Path(path).resolve()
+        if self.excluded_path(path):
+            raise ValueError('Image is in an excluded hidden folder')
         if not any(path.is_relative_to(root) for root in self.roots):
             raise ValueError('Image is outside configured roots')
         return path
@@ -500,6 +519,11 @@ class Index:
             for root in roots:
                 if interrupted():
                     return
+                if self.excluded_directory(root):
+                    self.log.info('Skipping hidden scan root: %s', root)
+                    with self.state_lock:
+                        self.state['roots'][str(root)] = 'Excluded hidden folder'
+                    continue
                 if not root.is_dir():
                     self.log.warning('Root unavailable: %s', root)
                     with self.state_lock:
@@ -513,7 +537,7 @@ class Index:
                 for directory, dirs, files in os.walk(root, followlinks=False, onerror=lambda e: errors.append(str(e))):
                     if interrupted():
                         return
-                    dirs[:] = [d for d in dirs if not (Path(directory) / d).is_symlink()]
+                    dirs[:] = [d for d in dirs if not d.startswith('.') and not (Path(directory) / d).is_symlink()]
                     for name in files:
                         candidate = Path(directory) / name
                         if candidate.suffix.lower() not in EXTENSIONS or candidate.is_symlink():
@@ -603,6 +627,8 @@ class Index:
                          metadata['raw'] if metadata else '']).lower()
 
     def process_embedding(self, path, expected_generation=None):
+        if self.excluded_path(path):
+            return
         with self.control_lock:
             if self.paused or (expected_generation is not None and expected_generation != self.generation):
                 return
@@ -699,6 +725,8 @@ class Index:
             self._process_llama(path, expected_generation)
 
     def _process_llama(self, path, expected_generation=None):
+        if self.excluded_path(path):
+            return
         with self.control_lock:
             if self.paused or (expected_generation is not None and expected_generation != self.generation):
                 return

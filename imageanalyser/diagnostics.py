@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 HEADER = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+) (DEBUG|INFO|WARNING|ERROR|CRITICAL) (?:\[(error|warning|success|activity)\] )?(.*)$')
-SUCCESS = re.compile(r'^(Indexed image in |Reused analysis by SHA-256:|OpenCLIP (?:indexed|hash reused):|Database backup created|Database restored;|Settings saved;|Image data manually corrected:|Removed image from index:)')
+SUCCESS = re.compile(r'^(Indexed image in |Reused analysis by SHA-256:|OpenCLIP (?:indexed|hash reused):|Database backup created|Database restored;|Settings saved;|Image data manually corrected:|Removed image from index:|Removed \d+ records from hidden folders)')
 
 
 def category_for(level, message, explicit=None):
