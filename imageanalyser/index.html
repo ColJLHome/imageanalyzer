@@ -10,7 +10,7 @@ dialog{max-width:520px;width:calc(100% - 64px);padding:24px;border:1px solid #46
 #edit-dialog{max-width:800px;max-height:85vh;overflow:auto}#edit-form{display:grid}#edit-form label{display:grid;gap:5px}#edit-form textarea{font:inherit;min-height:70px;padding:10px;background:#111720;color:inherit;border:1px solid #465365;border-radius:6px;resize:vertical}.person-entry{display:grid;gap:8px;border:1px solid #465365;border-radius:8px;padding:12px;margin:10px 0}#edit-path{overflow-wrap:anywhere}
 .log-entry{display:block;margin-bottom:10px}.log-entry.error{color:#ff9c9c}.log-entry.warning{color:#f2d184}.log-entry.success{color:#90deb0}.log-entry.activity{color:#c2cfdf}
 .scan-badge{display:inline-block;background:#303f52;padding:3px 7px;margin:3px;border-radius:5px;font-size:12px;border:1px solid #6583a6;cursor:help}.scan-badge:focus-visible{outline:2px solid #9dc9ff}#scan-tooltip{position:fixed;z-index:1000;width:min(620px,calc(100vw - 32px));max-height:60vh;overflow:auto;box-sizing:border-box;padding:16px;background:#101c2b;color:#e9edf5;border:1px solid #6583a6;border-radius:10px;box-shadow:0 8px 30px #0009}#scan-tooltip pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 monospace;margin-bottom:0}
-.scan-badges{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px}.scan-badge{margin:0}.scan-badge.openclip{border-color:#79b1f4}.scan-badge.a1111{border-color:#dcbd70}.scan-badge.ram{border-color:#80d3a3}.scan-badge.llama{border-color:#c09be9}
+.scan-badges{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px}.scan-badge{margin:0;padding:3px 5px;font-size:11px;white-space:nowrap}.scan-badge.openclip{border-color:#79b1f4}.scan-badge.a1111{border-color:#dcbd70}.scan-badge.ram{border-color:#80d3a3}.scan-badge.llama{border-color:#c09be9}
 .image-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.image-actions button{font-size:12px;padding:7px 9px;min-width:0;white-space:nowrap}
 .search-filters{flex-basis:100%;margin:0}.search-filters .controls{margin:10px 0}
 #image-preview{position:fixed;inset:50% auto auto 50%;transform:translate(-50%,-50%);width:70vw;height:70vh;z-index:900;pointer-events:none;background:#0b1018;border:1px solid #6583a6;border-radius:12px;box-shadow:0 8px 40px #000b;padding:12px;box-sizing:border-box}#image-preview img{width:100%;height:100%;object-fit:contain}#image-preview-message{position:absolute;inset:45% 12px auto;text-align:center;color:#e9edf5}article img{cursor:zoom-in}
@@ -229,7 +229,7 @@ function scanBadges(item){
     const row=node('div',undefined,'scan-badges');row.setAttribute('aria-label','Completed image scans');
     for(const type of ['openclip','a1111','ram','llama']){
         if(!item.scans?.[type])continue;
-        const label=type==='a1111'&&!item.scans.a1111.metadata_saved?'A1111 (none)':type==='ram'?'RAM++':type==='llama'?'llama-server':type==='a1111'?'A1111':'OpenCLIP';
+        const label=type==='a1111'&&!item.scans.a1111.metadata_saved?'A1111 (none)':type==='ram'?'RAM++':type==='llama'?'llama':type==='a1111'?'A1111':'CLIP';
         const badge=node('button',label,'scan-badge '+type);badge.type='button';badge.setAttribute('aria-label','View '+scanLabels[type]+' scan data');
         badge.onmouseenter=()=>showScanTooltip(badge,item,type);badge.onfocus=()=>showScanTooltip(badge,item,type);badge.onclick=()=>showScanTooltip(badge,item,type);
         badge.onmouseleave=scheduleScanHide;badge.onblur=scheduleScanHide;row.append(badge);
