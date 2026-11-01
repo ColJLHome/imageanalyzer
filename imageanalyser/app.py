@@ -173,6 +173,16 @@ def create_app(config, restart_callback=None):
     def scan_now(body: ClearRequest):
         return {'status': index.request_scan()}
 
+    @app.post('/api/scan/pause')
+    def pause_scan(body: ClearRequest):
+        index.pause()
+        return {'paused': True}
+
+    @app.post('/api/scan/cancel')
+    def cancel_scan(body: ClearRequest):
+        index.pause(cancel=True)
+        return {'cancelled': True, 'paused': True}
+
     @app.post('/api/scan/resume')
     def resume_scan(body: ClearRequest):
         index.resume()

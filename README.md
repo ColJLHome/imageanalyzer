@@ -43,7 +43,7 @@ OpenCLIP-only and llama-server-only modes are also available. The supplied PyTor
 
 ## Managing the index
 
-**Scan for new images** checks configured folders immediately. Progress shows the current pass, checked/remaining counts, and estimated time. Completed work resumes after restarts. SHA-256 matching reuses analysis when identical files move or are copied.
+**Scan for new images** checks configured folders immediately. Progress shows the current pass, checked/remaining counts, and estimated time. **Pause scanning** finishes the current image and waits for Resume. **Cancel scan** discards unfinished analysis and pauses further scanning, keeping indexed results; an active model request may take time to return. Both remain paused after restarts. Completed work resumes when scanning is restarted. SHA-256 matching reuses analysis when identical files move or are copied.
 
 **Remove from index** excludes an individual path from future scans. **Settings → Clear image index** clears records and exclusions after confirmation, then pauses scanning. Resume to rebuild. Neither action deletes source files.
 

@@ -1,5 +1,6 @@
 import json
 import io
+import struct
 import hashlib
 import os
 import shutil
@@ -849,6 +850,79 @@ class IndexTests(unittest.TestCase):
         with self.index.scan_lock:
             self.assertEqual(self.index.request_scan(), 'running')
             self.assertFalse(self.index.wake.is_set())
+
+    def test_pause_and_cancel_during_each_analysis_stage(self):
+        other = self.root / 'z-last.png'
+        Image.new('RGB', (30, 30), 'blue').save(other)
+        for stage in ('llama', 'openclip', 'ram'):
+            for cancel in (False, True):
+                with self.subTest(stage=stage, cancel=cancel):
+                    config = {**self.config, 'data_dir': str(self.base / f'{stage}-{cancel}'),
+                              'analysis_backend': 'openclip' if stage != 'llama' else 'llama',
+                              'recognize_enabled': stage == 'ram'}
+                    index = Index(config)
+                    self.addCleanup(index.log_handler.close)
+                    started, finish = threading.Event(), threading.Event()
+                    calls = []
+                    def active(path, *args):
+                        calls.append(path)
+                        started.set()
+                        if not finish.wait(5):
+                            raise RuntimeError('Test analysis timed out')
+                        if stage == 'openclip':
+                            return struct.pack('<ff', 1, 0)
+                        if stage == 'ram':
+                            return {'tags': ['person'], 'tags_chinese': []}
+                        return self.fake_analysis(path)
+                    target, method = ((index, 'analyse') if stage == 'llama' else
+                                      (index.encoder, 'image') if stage == 'openclip' else
+                                      (index.recognizer, 'image'))
+                    with patch.object(index.encoder, 'image', return_value=struct.pack('<ff', 1, 0)), \
+                         patch.object(target, method, side_effect=active):
+                        worker = threading.Thread(target=index.scan)
+                        worker.start()
+                        try:
+                            self.assertTrue(started.wait(5))
+                            index.pause(cancel=cancel)
+                            self.assertTrue(index.paused)
+                            if cancel:
+                                # An immediate Resume must not revive the cancelled scan/result.
+                                index.resume()
+                        finally:
+                            finish.set()
+                            worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                    self.assertEqual(calls, [self.file])
+                    field = {'llama': 'model', 'openclip': 'image_embedding', 'ram': 'ram_data'}[stage]
+                    with index.connect() as db:
+                        first = db.execute(f'SELECT {field} FROM images WHERE path=?', (str(self.file),)).fetchone()
+                        last = db.execute(f'SELECT {field} FROM images WHERE path=?', (str(other),)).fetchone()
+                    self.assertEqual(bool(first and first[0]), not cancel)
+                    self.assertFalse(last and last[0])
+                    if not cancel:
+                        restarted = Index(config)
+                        self.addCleanup(restarted.log_handler.close)
+                        self.assertTrue(restarted.paused)
+                        self.assertEqual(index.progress_snapshot()['phase'], 'paused')
+
+    def test_scan_control_api_persists_pause_and_preserves_completed_images(self):
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        for operation in ('pause', 'cancel'):
+            self.assertEqual(client.post('/api/scan/' + operation, json={'confirm': False}).status_code, 422)
+            response = client.post('/api/scan/' + operation, json={'confirm': True})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()['paused'])
+            self.assertTrue(client.get('/api/status').json()['paused'])
+            self.assertEqual(client.get('/api/search').json()['total'], 1)
+            restarted = Index(self.config)
+            self.addCleanup(restarted.log_handler.close)
+            self.assertTrue(restarted.paused)
+            self.assertEqual(client.post('/api/scan/resume', json={'confirm': True}).status_code, 200)
+            self.assertFalse(app.state.index.paused)
 
     def test_clear_during_analysis_discards_inflight_result(self):
         started, finish = threading.Event(), threading.Event()

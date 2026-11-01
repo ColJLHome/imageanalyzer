@@ -427,6 +427,21 @@ class Index:
             self.state.update(current=None, roots={}, last_scan=None)
         self.log.info('Scanner details cleared by user')
 
+    def pause(self, cancel=False):
+        with self.control_lock:
+            with self.connect() as db:
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('paused', 'true')")
+            self.paused = True
+            if cancel:
+                # Invalidate active results, including when a new scan is requested immediately.
+                self.generation += 1
+            with self.state_lock:
+                self.state['progress']['phase'] = 'cancelled' if cancel else 'paused'
+                if cancel:
+                    self.active_analysis_started = None
+        self.log.info('Scan cancelled by user; unfinished results will be discarded' if cancel
+                      else 'Scanning paused by user; current image may finish')
+
     def resume(self):
         with self.control_lock:
             with self.connect() as db:
@@ -562,18 +577,18 @@ class Index:
         return [path for _, path in ordered] + sorted(unavailable, key=str)
 
     def scan(self):
-        if self.paused or not self.scan_lock.acquire(blocking=False):
-            return
         with self.control_lock:
+            if self.paused or not self.scan_lock.acquire(blocking=False):
+                return
             scan_generation = self.generation
             roots = list(self.roots)
             backend = self.config.get('analysis_backend', 'llama')
             sort_by = self.config.get('scan_sort_by', 'name')
             sort_direction = self.config.get('scan_sort_direction', 'asc')
-        with self.state_lock:
-            self.reset_analysis_timing()
-            self.state.update(running=True, roots={}, progress={
-                'phase': 'discovering', 'scanned': 0, 'total': None, 'discovered': 0})
+            with self.state_lock:
+                self.reset_analysis_timing()
+                self.state.update(running=True, roots={}, progress={
+                    'phase': 'discovering', 'scanned': 0, 'total': None, 'discovered': 0})
         self.log.info('Scan started')
         def interrupted():
             return self.stop.is_set() or self.paused or scan_generation != self.generation
@@ -761,7 +776,7 @@ class Index:
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError('File changed during OpenCLIP analysis; will retry')
             with self.control_lock:
-                if self.paused or generation != self.generation:
+                if generation != self.generation:
                     return
                 with self.connect() as db:
                     previous = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
@@ -856,7 +871,7 @@ class Index:
             else:
                 _, palette, width, height = self.prepare(path)
             with self.control_lock:
-                if self.paused or generation != self.generation:
+                if generation != self.generation:
                     return
                 with self.connect() as db:
                     previous = db.execute('SELECT * FROM images WHERE path=?', (str(path),)).fetchone()
@@ -1009,7 +1024,7 @@ class Index:
             search = self.search_text(path, result, metadata, self.ram_for_hash(row, digest))
             with self.control_lock:
                 if generation != self.generation:
-                    self.log.info('Discarded analysis after index or settings changed: %s', path)
+                    self.log.info('Discarded analysis after scan cancellation, index or settings changed: %s', path)
                     return
                 with self.connect() as db:
                     updated = db.execute('''UPDATE images SET status='done',analysis=?,search_text=?,palette=?,
