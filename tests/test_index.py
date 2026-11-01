@@ -1,4 +1,5 @@
 import json
+import io
 import hashlib
 import os
 import shutil
@@ -96,6 +97,25 @@ class IndexTests(unittest.TestCase):
         Image.new('RGB', (20, 20)).save(self.base / 'secret.png')
         self.assertEqual(client.get(f'/api/images/{image_id}/thumbnail').status_code, 404)
         self.assertEqual(client.get('/').status_code, 200)
+
+    def test_large_preview_dimensions_and_access_boundary(self):
+        Image.new('RGB', (2400, 1200), 'red').save(self.file)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        client = TestClient(app)
+        image_id = client.get('/api/search').json()['items'][0]['id']
+        for preview, expected in [(False, (480, 240)), (True, (1600, 800))]:
+            response = client.get(f'/api/images/{image_id}/thumbnail', params={'preview': preview})
+            self.assertEqual(response.status_code, 200)
+            with Image.open(io.BytesIO(response.content)) as image:
+                self.assertEqual(image.size, expected)
+        self.file.unlink()
+        Image.new('RGB', (20, 20)).save(self.base / 'secret.png')
+        self.file.symlink_to(self.base / 'secret.png')
+        self.assertEqual(client.get(f'/api/images/{image_id}/thumbnail?preview=true').status_code, 404)
+        self.assertEqual(client.get('/api/images/9999/thumbnail?preview=true').status_code, 404)
 
     def test_llama_request_and_validation(self):
         response = type('Response', (), {'raise_for_status': lambda self: None,

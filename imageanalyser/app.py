@@ -228,7 +228,7 @@ def create_app(config, restart_callback=None):
                 'retry_at': row['embedding_retry_at'] or None, 'embedding': vector}
 
     @app.get('/api/images/{image_id}/thumbnail')
-    def thumbnail(image_id: int):
+    def thumbnail(image_id: int, preview: bool = False):
         with index.connect() as db:
             row = db.execute("SELECT path FROM images WHERE id=? AND status!='removed'", (image_id,)).fetchone()
         if not row:
@@ -237,9 +237,9 @@ def create_app(config, restart_callback=None):
             path = index.permitted(row['path'])
             with Image.open(path) as source:
                 image = ImageOps.exif_transpose(source).convert('RGB')
-                image.thumbnail((480, 360))
+                image.thumbnail((1600, 1600) if preview else (480, 360))
                 out = io.BytesIO()
-                image.save(out, format='JPEG', quality=80)
+                image.save(out, format='JPEG', quality=90 if preview else 80)
                 return Response(out.getvalue(), media_type='image/jpeg')
         except (OSError, ValueError):
             raise HTTPException(404, 'Image unavailable')
