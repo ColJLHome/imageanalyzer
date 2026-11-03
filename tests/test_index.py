@@ -587,7 +587,8 @@ class IndexTests(unittest.TestCase):
         self.assertEqual([p['total'] for p in snapshots], [2, 2])
         self.assertEqual([p['scanned'] for p in snapshots], [0, 1])
         progress = self.index.state['progress']
-        self.assertEqual(progress, {'phase': 'complete', 'scanned': 2, 'total': 2, 'discovered': 2})
+        self.assertEqual(progress, {'phase': 'complete', 'scanned': 2, 'total': 2, 'discovered': 2,
+                                    'previously_completed': 0})
         with patch.object(self.index, 'analyse') as analyse:
             self.index.scan()
             analyse.assert_not_called()
@@ -840,6 +841,39 @@ class IndexTests(unittest.TestCase):
                 index.wake.set()
                 worker.join(5)
             self.assertFalse(worker.is_alive())
+
+    def test_scan_order_changes_preserve_llama_results_and_seed_progress(self):
+        from imageanalyser.settings import RuntimeSettings
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis):
+            self.index.scan()
+        newer = self.root / 'new.png'
+        Image.new('RGB', (30, 30), 'blue').save(newer)
+        self.index.save_settings(RuntimeSettings(**{**self.index.get_settings(),
+                                                   'scan_sort_direction': 'desc'}))
+        snapshots = []
+        def analyse(path):
+            snapshots.append(self.index.progress_snapshot())
+            return self.fake_analysis(path)
+        with patch.object(self.index, 'analyse', side_effect=analyse) as call:
+            self.index.scan()
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(call.call_args.args[0], newer)
+        self.assertEqual(snapshots[0]['scanned'], 1)
+        self.assertEqual(snapshots[0]['total'], 2)
+        self.assertEqual(snapshots[0]['previously_completed'], 1)
+        self.assertEqual(self.index.search()['total'], 2)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis) as call:
+            self.index.scan()
+        call.assert_not_called()
+        self.assertEqual(self.index.progress_snapshot()['scanned'], 2)
+        # Changed content must still be analysed, even when its old caption is saved.
+        Image.new('RGB', (40, 50), 'green').save(self.file)
+        with patch.object(self.index, 'analyse', side_effect=self.fake_analysis) as call:
+            self.index.scan()
+        self.assertEqual(call.call_count, 1)
+        app = create_app(self.config)
+        self.addCleanup(app.state.index.log_handler.close)
+        self.assertEqual(TestClient(app).get('/api/status').json()['llama_count'], 2)
 
     def test_scan_request_resumes_pause_and_avoids_duplicate_active_scan(self):
         self.index.clear()

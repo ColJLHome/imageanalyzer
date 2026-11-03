@@ -576,6 +576,31 @@ class Index:
         ordered.sort(key=lambda item: item[0], reverse=direction == 'desc')
         return [path for _, path in ordered] + sorted(unavailable, key=str)
 
+    def completed_llama_paths(self, candidates, interrupted):
+        """Count unchanged captions before a pass, independent of traversal order."""
+        with self.connect() as db:
+            rows = {row['path']: row for row in db.execute(
+                "SELECT path,status,size,mtime_ns,sha256,analysis_version,manually_edited FROM images")}
+        completed = set()
+        for path in candidates:
+            if interrupted():
+                break
+            row = rows.get(str(path))
+            if not row:
+                continue
+            if row['status'] == 'removed':
+                completed.add(path)
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            unchanged = (row['size'], row['mtime_ns']) == (stat.st_size, stat.st_mtime_ns)
+            if unchanged and (row['manually_edited'] or (
+                    row['sha256'] and row['status'] == 'done' and row['analysis_version'] >= ANALYSIS_VERSION)):
+                completed.add(path)
+        return completed
+
     def scan(self):
         with self.control_lock:
             if self.paused or not self.scan_lock.acquire(blocking=False):
@@ -678,14 +703,22 @@ class Index:
                         if scan_generation == self.generation:
                             self.state['progress']['scanned'] += 1
                 self.log.info('RAM++ tagging pass finished')
+            completed = set()
             if backend in ('llama', 'hybrid'):
+                completed = self.completed_llama_paths(candidates, interrupted)
+                if interrupted():
+                    return
                 with self.state_lock:
                     self.reset_analysis_timing()
-                    self.state['progress'].update(phase='scanning', scanned=0)
-                self.log.info('Llama-server pass started')
+                    self.state['progress'].update(phase='scanning', scanned=len(completed),
+                                                  previously_completed=len(completed))
+                self.log.info('Llama-server pass started: %s already complete, %s remaining',
+                              len(completed), len(candidates) - len(completed))
             for candidate in candidates if backend in ('llama', 'hybrid') else []:
                 if interrupted():
                     return
+                if candidate in completed:
+                    continue
                 with self.state_lock:
                     self.state['current'] = str(candidate)
                 try:

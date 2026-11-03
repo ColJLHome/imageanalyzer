@@ -150,6 +150,7 @@ def create_app(config, restart_callback=None):
             latest_indexed = db.execute("SELECT max(last_indexed_at) FROM images WHERE status='done'").fetchone()[0]
             embedded = db.execute("""SELECT count(*) FROM images WHERE status='done' AND image_embedding IS NOT NULL
                 AND embedding_model=? AND embedding_sha256=sha256""", (model_key(index.config),)).fetchone()[0]
+            llama_count = db.execute("SELECT count(*) FROM images WHERE status='done' AND model IS NOT NULL").fetchone()[0]
             recognized = db.execute("""SELECT count(*) FROM images WHERE status='done' AND ram_data IS NOT NULL
                 AND ram_sha256=sha256 AND (ram_model=? OR ram_manually_edited=1)""", (recognition_key(index.config),)).fetchone()[0]
             cleared = db.execute("SELECT value FROM settings WHERE key='diagnostics_cleared_at'").fetchone()
@@ -158,7 +159,7 @@ def create_app(config, restart_callback=None):
                 "SELECT path,coalesce(ram_error,embedding_error,error) AS error FROM images WHERE (status='error' OR ram_error IS NOT NULL OR embedding_error IS NOT NULL OR error IS NOT NULL) AND (? IS NULL OR updated>?) ORDER BY id DESC LIMIT 10",
                 (since, since))]
         with index.state_lock:
-            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'latest_indexed_at': latest_indexed, 'embedding_count': embedded, 'recognition_count': recognized, 'recognize_enabled': index.config.get('recognize_enabled', False), 'analysis_backend': index.config.get('analysis_backend', 'llama'), 'errors': errors}
+            return {**index.state, 'instance_id': app.state.instance_id, 'restart_supported': restart_callback is not None, 'restarting': app.state.restarting, 'paused': index.paused, 'roots': dict(index.state['roots']), 'progress': index.progress_snapshot(), 'counts': counts, 'latest_indexed_at': latest_indexed, 'embedding_count': embedded, 'llama_count': llama_count, 'recognition_count': recognized, 'recognize_enabled': index.config.get('recognize_enabled', False), 'analysis_backend': index.config.get('analysis_backend', 'llama'), 'errors': errors}
 
     @app.post('/api/scanner/details/clear')
     def clear_scanner_details(body: ClearRequest):
